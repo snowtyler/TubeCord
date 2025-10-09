@@ -138,9 +138,16 @@ class YouTubeNotification:
             # Use YouTube Data API v3 to get video details
             api_url = "https://www.googleapis.com/youtube/v3/videos"
             params = {
-                'part': 'liveStreamingDetails,snippet',
+                'part': 'liveStreamingDetails,snippet,status',
                 'id': video_id,
-                'key': api_key
+                'key': api_key,
+                'fields': (
+                    'items('
+                    'snippet(title,liveBroadcastContent),'
+                    'liveStreamingDetails(actualStartTime,actualEndTime,scheduledStartTime,scheduledEndTime),'
+                    'status(uploadStatus,lifeCycleStatus)'
+                    ')'
+                )
             }
             
             logger.debug(f"Checking YouTube API for video: {video_id}")
@@ -158,6 +165,9 @@ class YouTubeNotification:
                 # Check for live streaming details
                 live_details = video_data.get('liveStreamingDetails', {})
                 snippet = video_data.get('snippet', {})
+                status_info = video_data.get('status', {})
+                life_cycle_status = (status_info.get('lifeCycleStatus') or '').lower()
+                upload_status = (status_info.get('uploadStatus') or '').lower()
                 
                 # Check snippet for broadcast content first (more reliable for scheduled streams)
                 live_broadcast_content = snippet.get('liveBroadcastContent', 'none')
@@ -166,6 +176,9 @@ class YouTubeNotification:
                 scheduled_start_time = live_details.get('scheduledStartTime')
                 if scheduled_start_time:
                     data['scheduled_start_time'] = scheduled_start_time
+                scheduled_end_time = live_details.get('scheduledEndTime')
+                if scheduled_end_time:
+                    data['scheduled_end_time'] = scheduled_end_time
                 
                 # Determine if it's a livestream based on API data
                 if live_details:
@@ -175,42 +188,55 @@ class YouTubeNotification:
                     
                     if actual_start_time:
                         data['actual_start_time'] = actual_start_time
-                    
-                    if actual_start_time and not actual_end_time:
-                        # Some streams flip to broadcast "none" as soon as they end
-                        # before YouTube sets actualEndTime. Use broadcast state to avoid duplicates.
-                        if live_broadcast_content in ('none', 'completed'):
-                            logger.info("Detected completed livestream (broadcast content shows none/completed)")
-                            return NotificationType.LIVESTREAM_COMPLETED
-                        # Currently live
+
+                    # Treat anything with an end time or completed lifecycle as finished
+                    if actual_end_time:
+                        logger.info("Detected completed livestream via actualEndTime")
+                        return NotificationType.LIVESTREAM_COMPLETED
+
+                    if life_cycle_status in {'complete', 'completed'}:
+                        logger.info("Detected completed livestream via lifeCycleStatus")
+                        return NotificationType.LIVESTREAM_COMPLETED
+
+                    if upload_status == 'processed':
+                        logger.info("Detected completed livestream via uploadStatus processed")
+                        return NotificationType.LIVESTREAM_COMPLETED
+
+                    if actual_start_time and live_broadcast_content in ('none', 'completed'):
+                        logger.info("Detected completed livestream (broadcast content shows none/completed)")
+                        return NotificationType.LIVESTREAM_COMPLETED
+
+                    if actual_start_time:
                         logger.info(f"Detected LIVE stream: {data.get('title', 'Unknown')}")
                         return NotificationType.LIVESTREAM_LIVE
-                    elif scheduled_start_time and not actual_start_time:
-                        # Scheduled livestream (upcoming)
-                        logger.info(f"Detected scheduled livestream: {data.get('title', 'Unknown')} at {scheduled_start_time}")
+
+                    if scheduled_start_time and not actual_start_time:
+                        logger.info(
+                            "Detected scheduled livestream: %s at %s",
+                            data.get('title', 'Unknown'),
+                            scheduled_start_time
+                        )
                         return NotificationType.LIVESTREAM
-                    elif actual_start_time and actual_end_time:
-                        # Past livestream - don't send notification
-                        logger.info(f"Detected completed livestream (will skip notification): {data.get('title', 'Unknown')}")
-                        return NotificationType.LIVESTREAM_COMPLETED
                 
                 # Check broadcast content for additional information
                 # But prioritize liveStreamingDetails when they conflict
                 if live_broadcast_content == 'live':
-                    # If we have streaming details, validate the 'live' status
-                    if live_details:
-                        actual_start_time = live_details.get('actualStartTime')
-                        actual_end_time = live_details.get('actualEndTime')
-                        
-                        if actual_start_time and actual_end_time:
-                            logger.info(f"Stream ended but broadcast content still shows 'live' (will skip notification)")
-                            return NotificationType.LIVESTREAM_COMPLETED
-                        elif actual_start_time and not actual_end_time:
-                            logger.info(f"Detected LIVE stream from broadcast content (confirmed by streaming details)")
-                            return NotificationType.LIVESTREAM_LIVE
-                    
-                    # No streaming details or no conflict - trust broadcast content
-                    logger.info(f"Detected LIVE stream from broadcast content")
+                    actual_start_time = live_details.get('actualStartTime')
+                    actual_end_time = live_details.get('actualEndTime')
+
+                    if actual_end_time:
+                        logger.info("Stream ended but broadcast content still shows 'live'")
+                        return NotificationType.LIVESTREAM_COMPLETED
+
+                    if life_cycle_status in {'complete', 'completed'} or upload_status == 'processed':
+                        logger.info("Broadcast marked complete despite 'live' flag")
+                        return NotificationType.LIVESTREAM_COMPLETED
+
+                    if actual_start_time:
+                        logger.info("Detected LIVE stream from broadcast content (confirmed by start time)")
+                        return NotificationType.LIVESTREAM_LIVE
+
+                    logger.info("Detected LIVE stream from broadcast content without start time")
                     return NotificationType.LIVESTREAM_LIVE
                     
                 elif live_broadcast_content == 'upcoming':
