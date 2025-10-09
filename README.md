@@ -60,8 +60,7 @@ The app reads settings from environment variables (or `.env`). The most importan
 TubeCord uses SQLAlchemy for persistence and supports multiple engines out of the box:
 - SQLite (default, file stored under `data/`)
 - PostgreSQL (`postgresql+psycopg://` DSN)
-- MySQL (`mysql+pymysql://` DSN)
-- MariaDB (`mariadb+mariadbconnector://` DSN)
+- MySQL or MariaDB via the pure-Python PyMySQL driver (`mysql+pymysql://` DSN)
 
 Set the `DATABASE_URL` environment variable to point at your external database. When left unset, the app falls back to the bundled SQLite file. Use `DATABASE_ECHO=true` if you need to inspect generated SQL during troubleshooting.
 
