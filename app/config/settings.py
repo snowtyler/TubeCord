@@ -47,11 +47,30 @@ class Settings:
     # Discord Message Format Configuration
     USE_RICH_EMBEDS: bool = os.getenv('USE_RICH_EMBEDS', 'True').lower() == 'true'
     
+    # Community Posts
+    COMMUNITY_CHECK_INTERVAL_MINUTES: int = int(os.getenv('COMMUNITY_CHECK_INTERVAL_MINUTES', '15'))
+    
     def __init__(self):
         """Initialize settings from environment variables."""
         self.CALLBACK_URL, self.CALLBACK_PORT = self._resolve_callback_settings()
         self._load_discord_config()
         self._validate_required_settings()
+        # Normalize and validate community check interval
+        self._load_community_settings()
+
+    def _load_community_settings(self) -> None:
+        """Load and validate community post related settings."""
+        raw = os.getenv('COMMUNITY_CHECK_INTERVAL_MINUTES', str(self.COMMUNITY_CHECK_INTERVAL_MINUTES)).strip()
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 15
+        # Clamp to sensible bounds (1 minute to 1 day)
+        if value < 1:
+            value = 1
+        if value > 24 * 60:
+            value = 24 * 60
+        self.COMMUNITY_CHECK_INTERVAL_MINUTES = value
 
     def _resolve_callback_settings(self) -> tuple[str, int]:
         """Read and validate the WebSub callback configuration from the environment."""

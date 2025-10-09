@@ -675,7 +675,7 @@ def initialize_app():
             community_handler.initialize()
             
             # Initialize and start scheduler
-            check_interval = int(os.getenv('COMMUNITY_CHECK_INTERVAL_MINUTES', '15'))
+            check_interval = settings.COMMUNITY_CHECK_INTERVAL_MINUTES
             community_scheduler = CommunityPostScheduler(check_interval_minutes=check_interval)
             
             # Set up callbacks
