@@ -191,8 +191,11 @@ class YouTubeNotification:
                 logger.info("Detected completed livestream via uploadStatus processed")
                 return NotificationType.LIVESTREAM_COMPLETED
 
-            if actual_start_time and live_broadcast_content in ('none', 'completed'):
-                logger.info("Detected completed livestream (broadcast content shows none/completed)")
+            # If YouTube says the broadcast content is 'none' and we have live details,
+            # treat it as a completed livestream to avoid misclassifying as an upload.
+            # This covers cases where end flags propagate before actualEndTime.
+            if live_broadcast_content == 'none' and live_details:
+                logger.info("Detected completed livestream via broadcast content 'none'")
                 return NotificationType.LIVESTREAM_COMPLETED
 
             if actual_start_time and not active_live_chat_id and live_broadcast_content != 'live':
