@@ -268,9 +268,28 @@ class CommunityPostDatabase:
                 if result:
                     handle, last_verified = result
                     # Check if cache is still valid (30 days)
-                    from datetime import timezone
-                    # Parse as timezone-aware datetime
-                    last_verified_dt = datetime.fromisoformat(last_verified.replace('Z', '+00:00'))
+                    candidate_values = [last_verified]
+                    if last_verified.endswith('Z'):
+                        candidate_values.append(last_verified[:-1] + '+00:00')
+                    if last_verified.endswith('+00:00Z'):
+                        candidate_values.append(last_verified[:-1])
+                    if last_verified.endswith('+00:00+00:00'):
+                        candidate_values.append(last_verified[:-6])
+
+                    last_verified_dt = None
+                    for candidate in candidate_values:
+                        try:
+                            last_verified_dt = datetime.fromisoformat(candidate)
+                            break
+                        except ValueError:
+                            continue
+
+                    if not last_verified_dt:
+                        logger.warning(
+                            "Invalid cached timestamp for channel %s, discarding handle cache",
+                            channel_id
+                        )
+                        return None
                     if (datetime.now(timezone.utc) - last_verified_dt).days < 30:
                         return handle
                     else:
@@ -284,8 +303,7 @@ class CommunityPostDatabase:
     def cache_handle(self, channel_id: str, handle: str, channel_name: str = None) -> bool:
         """Cache a channel handle in the database."""
         try:
-            from datetime import timezone
-            now = datetime.now(timezone.utc).isoformat() + 'Z'
+            now = datetime.now(timezone.utc).isoformat()
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("""
                     INSERT OR REPLACE INTO channel_handles 
@@ -698,11 +716,11 @@ class CommunityPostScraper:
                 # Default to current time if can't parse
                 timestamp = now
             
-            return timestamp.isoformat() + 'Z'
+            return timestamp.isoformat()
             
         except Exception as e:
             logger.error(f"Error parsing time_since '{time_since}': {e}")
-            return datetime.now(timezone.utc).isoformat() + 'Z'
+            return datetime.now(timezone.utc).isoformat()
     
 
     
