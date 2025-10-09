@@ -6,7 +6,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from typing import Optional, Dict, Any
+import logging
 import os
+import time
+
+import requests
+
+
+YOUTUBE_API_PROPAGATION_DELAY = 3  # Wait for YouTube API to reflect new video state
 
 
 class NotificationType(Enum):
@@ -69,9 +76,6 @@ class YouTubeNotification:
           -> 'live' => LIVESTREAM_LIVE, 'upcoming' => LIVESTREAM, else => LIVESTREAM_COMPLETED
         - If liveStreamingDetails missing: treat as regular UPLOAD
         """
-        import requests
-        import logging
-
         logger = logging.getLogger(__name__)
 
         video_id = data.get('video_id')
@@ -99,10 +103,8 @@ class YouTubeNotification:
                 'key': api_key,
                 'fields': 'items(snippet(liveBroadcastContent),liveStreamingDetails(actualStartTime,actualEndTime,scheduledStartTime,scheduledEndTime))'
             }
-            # Fixed delay to allow YouTube to populate API state after WebSub push
-            import time
-            logger.debug("Delaying 3s before YouTube API fetch for %s", video_id)
-            time.sleep(3)
+            logger.debug("Delaying %ss before YouTube API fetch for %s", YOUTUBE_API_PROPAGATION_DELAY, video_id)
+            time.sleep(YOUTUBE_API_PROPAGATION_DELAY)
             logger.debug("Fetching video state from YouTube API for %s", video_id)
             resp = requests.get(api_url, params=params, timeout=10)
             if resp.status_code != 200:

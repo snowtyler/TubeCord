@@ -331,22 +331,11 @@ class CommunityPostScraper:
 
     def __init__(
         self,
-        db_path: Optional[str] = None,
         *,
         database_url: Optional[str] = None,
         engine: Optional[Engine] = None,
     ):
-        if db_path and database_url:
-            raise ValueError("Provide either db_path or database_url, not both.")
-
-        resolved_url = database_url
-        if db_path:
-            if db_path.startswith("sqlite://"):
-                resolved_url = db_path
-            else:
-                resolved_url = f"sqlite:///{os.path.abspath(db_path).replace(os.sep, '/')}"
-
-        self.db = CommunityPostDatabase(database_url=resolved_url, engine=engine)
+        self.db = CommunityPostDatabase(database_url=database_url, engine=engine)
         self.yp_dl_available = self._check_yp_dl_availability()
     
     def _check_yp_dl_availability(self) -> bool:
