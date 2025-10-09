@@ -145,7 +145,7 @@ class YouTubeNotification:
                     'items('
                     'snippet(title,liveBroadcastContent),'
                     'liveStreamingDetails(actualStartTime,actualEndTime,scheduledStartTime,scheduledEndTime),'
-                    'status(uploadStatus,lifeCycleStatus)'
+                    'status(uploadStatus)'
                     ')'
                 )
             }
