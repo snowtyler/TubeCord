@@ -1,6 +1,7 @@
 """Application settings and environment variable management."""
 
 import os
+from pathlib import Path
 from typing import List
 from urllib.parse import urlsplit
 
@@ -21,6 +22,7 @@ class Settings:
     
     # YouTube Configuration
     YOUTUBE_CHANNEL_ID: str = os.getenv('YOUTUBE_CHANNEL_ID', '')
+    YOUTUBE_API_KEY: str = os.getenv('YOUTUBE_API_KEY', '').strip()
     
     # Discord Configuration - Per Content Type
     # Upload notifications
@@ -34,6 +36,10 @@ class Settings:
     # Community post notifications
     COMMUNITY_WEBHOOK_URLS: List[str] = []
     COMMUNITY_ROLE_IDS: List[str] = []
+
+    # Database configuration
+    DATABASE_URL: str = os.getenv('DATABASE_URL', 'sqlite:///data/community_posts.db')
+    DATABASE_ECHO: bool = os.getenv('DATABASE_ECHO', 'False').lower() == 'true'
     
     # Server Configuration
     HOST: str = os.getenv('HOST', '0.0.0.0')
@@ -46,11 +52,49 @@ class Settings:
     # Discord Message Format Configuration
     USE_RICH_EMBEDS: bool = os.getenv('USE_RICH_EMBEDS', 'True').lower() == 'true'
     
+    # Community Posts
+    COMMUNITY_CHECK_INTERVAL_MINUTES: int = int(os.getenv('COMMUNITY_CHECK_INTERVAL_MINUTES', '15'))
+    
     def __init__(self):
         """Initialize settings from environment variables."""
         self.CALLBACK_URL, self.CALLBACK_PORT = self._resolve_callback_settings()
         self._load_discord_config()
+        self._load_database_settings()
         self._validate_required_settings()
+        # Normalize and validate community check interval
+        self._load_community_settings()
+
+    def _load_community_settings(self) -> None:
+        """Load and validate community post related settings."""
+        raw = os.getenv('COMMUNITY_CHECK_INTERVAL_MINUTES', str(self.COMMUNITY_CHECK_INTERVAL_MINUTES)).strip()
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 15
+        # Clamp to sensible bounds (1 minute to 1 day)
+        if value < 1:
+            value = 1
+        if value > 24 * 60:
+            value = 24 * 60
+        self.COMMUNITY_CHECK_INTERVAL_MINUTES = value
+
+    def _load_database_settings(self) -> None:
+        """Normalize database configuration settings."""
+        raw_url = os.getenv('DATABASE_URL', self.DATABASE_URL).strip()
+        if not raw_url:
+            raw_url = 'sqlite:///data/community_posts.db'
+
+        if raw_url.startswith('sqlite:///') and not raw_url.startswith('sqlite:///:'):
+            db_path = raw_url.replace('sqlite:///', '', 1)
+            resolved = Path(db_path).expanduser()
+            if not resolved.is_absolute():
+                resolved = (Path.cwd() / resolved).resolve()
+            self.DATABASE_URL = f"sqlite:///{resolved.as_posix()}"
+        else:
+            self.DATABASE_URL = raw_url
+
+        raw_echo = os.getenv('DATABASE_ECHO', 'false').strip().lower()
+        self.DATABASE_ECHO = raw_echo in {'1', 'true', 'yes', 'on'}
 
     def _resolve_callback_settings(self) -> tuple[str, int]:
         """Read and validate the WebSub callback configuration from the environment."""

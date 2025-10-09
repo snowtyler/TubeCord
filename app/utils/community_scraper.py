@@ -5,7 +5,6 @@ Handles fetching, processing, and storing community posts.
 
 import logging
 import json
-import sqlite3
 import os
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
@@ -15,8 +14,63 @@ import hashlib
 import subprocess
 import tempfile
 import requests
+import re
+
+from sqlalchemy import (
+    Boolean,
+    Column,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    Text,
+    delete,
+    select,
+    update,
+    Index,
+)
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.orm import Session
+from sqlalchemy.engine import Engine
+
+from app.config.settings import settings
+from app.db import get_engine
 
 logger = logging.getLogger(__name__)
+
+
+metadata = MetaData()
+
+community_posts_table = Table(
+    "community_posts",
+    metadata,
+    Column("post_id", String(255), primary_key=True),
+    Column("channel_id", String(255), nullable=False),
+    Column("channel_name", String(255), nullable=False),
+    Column("content", Text, nullable=False),
+    Column("image_urls", Text),
+    Column("video_attachments", Text),
+    Column("poll_data", Text),
+    Column("published_time", String(64), nullable=False),
+    Column("like_count", Integer),
+    Column("url", Text, nullable=False),
+    Column("content_hash", String(64), nullable=False),
+    Column("scraped_at", String(64), nullable=False),
+    Column("notified", Boolean, nullable=False, default=False),
+)
+
+channel_handles_table = Table(
+    "channel_handles",
+    metadata,
+    Column("channel_id", String(255), primary_key=True),
+    Column("handle", String(255), nullable=False),
+    Column("channel_name", String(255)),
+    Column("resolved_at", String(64), nullable=False),
+    Column("last_verified", String(64), nullable=False),
+)
+
+Index('idx_channel_published', community_posts_table.c.channel_id, community_posts_table.c.published_time)
+Index('idx_notified', community_posts_table.c.notified, community_posts_table.c.published_time)
 
 
 @dataclass
@@ -57,254 +111,231 @@ class CommunityPost:
 
 
 class CommunityPostDatabase:
-    """SQLite database for storing and tracking community posts."""
-    
-    def __init__(self, db_path: str = "community_posts.db"):
-        self.db_path = db_path
+    """Database helper for storing and tracking community posts."""
+
+    def __init__(self, database_url: Optional[str] = None, *, engine: Optional[Engine] = None):
+        self.database_url = database_url or settings.DATABASE_URL
+        self.engine = engine or get_engine(self.database_url)
         self._init_database()
-    
-    def _init_database(self):
-        """Initialize the database schema."""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS community_posts (
-                    post_id TEXT PRIMARY KEY,
-                    channel_id TEXT NOT NULL,
-                    channel_name TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    image_urls TEXT,
-                    video_attachments TEXT,
-                    poll_data TEXT,
-                    published_time TEXT NOT NULL,
-                    like_count INTEGER,
-                    url TEXT NOT NULL,
-                    content_hash TEXT NOT NULL,
-                    scraped_at TEXT NOT NULL,
-                    notified BOOLEAN DEFAULT FALSE
-                )
-            """)
-            
-            # Create table for caching channel handles
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS channel_handles (
-                    channel_id TEXT PRIMARY KEY,
-                    handle TEXT NOT NULL,
-                    channel_name TEXT,
-                    resolved_at TEXT NOT NULL,
-                    last_verified TEXT NOT NULL
-                )
-            """)
-            
-            # Create index for faster queries
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_channel_published 
-                ON community_posts(channel_id, published_time DESC)
-            """)
-            
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_notified 
-                ON community_posts(notified, published_time DESC)
-            """)
-            
-            # Create table for caching channel handles
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS channel_handles (
-                    channel_id TEXT PRIMARY KEY,
-                    handle TEXT NOT NULL,
-                    channel_name TEXT,
-                    resolved_at TEXT NOT NULL,
-                    last_verified TEXT NOT NULL
-                )
-            """)
-    
+
+    def _init_database(self) -> None:
+        """Ensure database schema exists."""
+        try:
+            metadata.create_all(self.engine, checkfirst=True)
+        except SQLAlchemyError as exc:
+            logger.error("Database initialization error: %s", exc)
+            raise
+
     def store_post(self, post: CommunityPost) -> bool:
-        """
-        Store a community post in the database.
-        
-        Args:
-            post: CommunityPost to store
-            
-        Returns:
-            True if stored successfully, False if already exists
-        """
+        """Store a community post in the database."""
+        record = {
+            "post_id": post.post_id,
+            "channel_id": post.channel_id,
+            "channel_name": post.channel_name,
+            "content": post.content,
+            "image_urls": json.dumps(post.image_urls),
+            "video_attachments": json.dumps(post.video_attachments),
+            "poll_data": json.dumps(post.poll_data) if post.poll_data else None,
+            "published_time": post.published_time,
+            "like_count": post.like_count,
+            "url": post.url,
+            "content_hash": post.content_hash,
+            "scraped_at": datetime.now(timezone.utc).isoformat(),
+            "notified": False,
+        }
+
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute("""
-                    INSERT OR IGNORE INTO community_posts (
-                        post_id, channel_id, channel_name, content, image_urls,
-                        video_attachments, poll_data, published_time, like_count,
-                        url, content_hash, scraped_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    post.post_id,
-                    post.channel_id,
-                    post.channel_name,
-                    post.content,
-                    json.dumps(post.image_urls),
-                    json.dumps(post.video_attachments),
-                    json.dumps(post.poll_data) if post.poll_data else None,
-                    post.published_time,
-                    post.like_count,
-                    post.url,
-                    post.content_hash,
-                    datetime.now(timezone.utc).isoformat()
-                ))
-                
-                # Return True if a row was inserted
-                return conn.total_changes > 0
-                
-        except sqlite3.Error as e:
-            logger.error(f"Database error storing post {post.post_id}: {e}")
+            with Session(self.engine) as session:
+                try:
+                    session.execute(community_posts_table.insert().values(**record))
+                    session.commit()
+                    return True
+                except IntegrityError:
+                    session.rollback()
+                    return False
+        except SQLAlchemyError as exc:
+            logger.error("Database error storing post %s: %s", post.post_id, exc)
             return False
-    
-    def get_unnotified_posts(self, channel_id: str = None) -> List[CommunityPost]:
-        """
-        Get community posts that haven't been notified yet.
-        
-        Args:
-            channel_id: Optional channel ID to filter by
-            
-        Returns:
-            List of unnotified CommunityPost objects
-        """
+
+    def get_unnotified_posts(self, channel_id: Optional[str] = None) -> List[CommunityPost]:
+        """Get community posts that haven't been notified yet."""
+        stmt = select(community_posts_table).where(community_posts_table.c.notified.is_(False))
+
+        if channel_id:
+            stmt = stmt.where(community_posts_table.c.channel_id == channel_id)
+
+        stmt = stmt.order_by(community_posts_table.c.published_time.desc())
+
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                if channel_id:
-                    cursor = conn.execute("""
-                        SELECT * FROM community_posts 
-                        WHERE channel_id = ? AND notified = FALSE 
-                        ORDER BY published_time DESC
-                    """, (channel_id,))
-                else:
-                    cursor = conn.execute("""
-                        SELECT * FROM community_posts 
-                        WHERE notified = FALSE 
-                        ORDER BY published_time DESC
-                    """)
-                
-                posts = []
-                for row in cursor.fetchall():
-                    post = self._row_to_post(row)
-                    posts.append(post)
-                
-                return posts
-                
-        except sqlite3.Error as e:
-            logger.error(f"Database error getting unnotified posts: {e}")
+            with Session(self.engine) as session:
+                rows = session.execute(stmt).mappings().all()
+                return [self._row_to_post(row) for row in rows]
+        except SQLAlchemyError as exc:
+            logger.error("Database error getting unnotified posts: %s", exc)
             return []
-    
+
     def mark_notified(self, post_id: str) -> bool:
-        """
-        Mark a post as notified.
-        
-        Args:
-            post_id: ID of the post to mark as notified
-            
-        Returns:
-            True if marked successfully
-        """
+        """Mark a post as notified."""
+        stmt = (
+            update(community_posts_table)
+            .where(community_posts_table.c.post_id == post_id)
+            .values(notified=True)
+        )
+
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute("""
-                    UPDATE community_posts 
-                    SET notified = TRUE 
-                    WHERE post_id = ?
-                """, (post_id,))
-                
-                return conn.total_changes > 0
-                
-        except sqlite3.Error as e:
-            logger.error(f"Database error marking post {post_id} as notified: {e}")
+            with Session(self.engine) as session:
+                result = session.execute(stmt)
+                session.commit()
+                return result.rowcount > 0 if result.rowcount is not None else True
+        except SQLAlchemyError as exc:
+            logger.error("Database error marking post %s as notified: %s", post_id, exc)
             return False
-    
-    def _row_to_post(self, row) -> CommunityPost:
+
+    def _row_to_post(self, row: Dict[str, Any]) -> CommunityPost:
         """Convert database row to CommunityPost object."""
         return CommunityPost(
-            post_id=row[0],
-            channel_id=row[1],
-            channel_name=row[2],
-            content=row[3],
-            image_urls=json.loads(row[4]) if row[4] else [],
-            video_attachments=json.loads(row[5]) if row[5] else [],
-            poll_data=json.loads(row[6]) if row[6] else None,
-            published_time=row[7],
-            like_count=row[8],
-            url=row[9]
+            post_id=row["post_id"],
+            channel_id=row["channel_id"],
+            channel_name=row["channel_name"],
+            content=row["content"],
+            image_urls=json.loads(row["image_urls"]) if row["image_urls"] else [],
+            video_attachments=json.loads(row["video_attachments"]) if row["video_attachments"] else [],
+            poll_data=json.loads(row["poll_data"]) if row["poll_data"] else None,
+            published_time=row["published_time"],
+            like_count=row["like_count"],
+            url=row["url"],
         )
-    
-    def cleanup_old_posts(self, days: int = 30):
-        """
-        Clean up old posts from the database.
-        
-        Args:
-            days: Number of days to keep posts
-        """
+
+    def cleanup_old_posts(self, days: int = 30) -> None:
+        """Clean up old posts from the database."""
         cutoff_date = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-        
+
+        stmt = delete(community_posts_table).where(
+            community_posts_table.c.published_time < cutoff_date,
+            community_posts_table.c.notified.is_(True),
+        )
+
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.execute("""
-                    DELETE FROM community_posts 
-                    WHERE published_time < ? AND notified = TRUE
-                """, (cutoff_date,))
-                
-                deleted_count = cursor.rowcount
-                if deleted_count > 0:
-                    logger.info(f"Cleaned up {deleted_count} old community posts")
-                    
-        except sqlite3.Error as e:
-            logger.error(f"Database error during cleanup: {e}")
-    
+            with Session(self.engine) as session:
+                result = session.execute(stmt)
+                session.commit()
+                deleted = result.rowcount or 0
+                if deleted > 0:
+                    logger.info("Cleaned up %s old community posts", deleted)
+        except SQLAlchemyError as exc:
+            logger.error("Database error during cleanup: %s", exc)
+
     def get_cached_handle(self, channel_id: str) -> Optional[str]:
         """Get cached channel handle from database."""
+        stmt = select(
+            channel_handles_table.c.handle,
+            channel_handles_table.c.last_verified,
+        ).where(channel_handles_table.c.channel_id == channel_id)
+
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.execute("""
-                    SELECT handle, last_verified FROM channel_handles 
-                    WHERE channel_id = ?
-                """, (channel_id,))
-                
-                result = cursor.fetchone()
-                if result:
-                    handle, last_verified = result
-                    # Check if cache is still valid (30 days)
-                    from datetime import timezone
-                    # Parse as timezone-aware datetime
-                    last_verified_dt = datetime.fromisoformat(last_verified.replace('Z', '+00:00'))
-                    if (datetime.now(timezone.utc) - last_verified_dt).days < 30:
-                        return handle
-                    else:
-                        logger.debug(f"Cached handle for {channel_id} is stale, will refresh")
-                
-                return None
-        except sqlite3.Error as e:
-            logger.error(f"Database error getting cached handle: {e}")
+            with Session(self.engine) as session:
+                result = session.execute(stmt).first()
+        except SQLAlchemyError as exc:
+            logger.error("Database error getting cached handle: %s", exc)
             return None
-    
-    def cache_handle(self, channel_id: str, handle: str, channel_name: str = None) -> bool:
+
+        if not result:
+            return None
+
+        handle, last_verified = result
+        candidate_values = [last_verified]
+
+        if last_verified.endswith('Z'):
+            candidate_values.append(last_verified[:-1] + '+00:00')
+        if last_verified.endswith('+00:00Z'):
+            candidate_values.append(last_verified[:-1])
+        if last_verified.endswith('+00:00+00:00'):
+            candidate_values.append(last_verified[:-6])
+
+        last_verified_dt = None
+        for candidate in candidate_values:
+            try:
+                last_verified_dt = datetime.fromisoformat(candidate)
+                break
+            except ValueError:
+                continue
+
+        if not last_verified_dt:
+            logger.warning(
+                "Invalid cached timestamp for channel %s, discarding handle cache",
+                channel_id,
+            )
+            return None
+
+        if (datetime.now(timezone.utc) - last_verified_dt).days < 30:
+            return handle
+
+        logger.debug("Cached handle for %s is stale, will refresh", channel_id)
+        return None
+
+    def cache_handle(self, channel_id: str, handle: str, channel_name: Optional[str] = None) -> bool:
         """Cache a channel handle in the database."""
+        now = datetime.now(timezone.utc).isoformat()
+        insert_stmt = channel_handles_table.insert().values(
+            channel_id=channel_id,
+            handle=handle,
+            channel_name=channel_name,
+            resolved_at=now,
+            last_verified=now,
+        )
+
         try:
-            from datetime import timezone
-            now = datetime.now(timezone.utc).isoformat() + 'Z'
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute("""
-                    INSERT OR REPLACE INTO channel_handles 
-                    (channel_id, handle, channel_name, resolved_at, last_verified)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (channel_id, handle, channel_name, now, now))
-                
-                logger.info(f"Cached handle for {channel_id}: {handle}")
+            with Session(self.engine) as session:
+                try:
+                    session.execute(insert_stmt)
+                    session.commit()
+                except IntegrityError:
+                    session.rollback()
+                    update_stmt = (
+                        update(channel_handles_table)
+                        .where(channel_handles_table.c.channel_id == channel_id)
+                        .values(
+                            handle=handle,
+                            channel_name=channel_name,
+                            last_verified=now,
+                            resolved_at=now,
+                        )
+                    )
+                    session.execute(update_stmt)
+                    session.commit()
+                logger.info("Cached handle for %s: %s", channel_id, handle)
                 return True
-        except sqlite3.Error as e:
-            logger.error(f"Database error caching handle: {e}")
+        except SQLAlchemyError as exc:
+            logger.error("Database error caching handle: %s", exc)
             return False
+
+    def get_cached_channel_name(self, channel_id: str) -> Optional[str]:
+        """Return cached channel name for a channel if available."""
+        stmt = select(channel_handles_table.c.channel_name).where(
+            channel_handles_table.c.channel_id == channel_id,
+            channel_handles_table.c.channel_name.isnot(None),
+        )
+
+        try:
+            with Session(self.engine) as session:
+                return session.execute(stmt).scalar_one_or_none()
+        except SQLAlchemyError as exc:
+            logger.error("Database error getting cached channel name: %s", exc)
+            return None
 
 
 class CommunityPostScraper:
     """Main class for scraping YouTube community posts using yp-dl CLI tool."""
     
-    def __init__(self, db_path: str = "community_posts.db"):
-        self.db = CommunityPostDatabase(db_path)
+    _CHANNELS_API_URL = "https://youtube.googleapis.com/youtube/v3/channels"
+
+    def __init__(
+        self,
+        *,
+        database_url: Optional[str] = None,
+        engine: Optional[Engine] = None,
+    ):
+        self.db = CommunityPostDatabase(database_url=database_url, engine=engine)
         self.yp_dl_available = self._check_yp_dl_availability()
     
     def _check_yp_dl_availability(self) -> bool:
@@ -336,68 +367,143 @@ class CommunityPostScraper:
             return cached_handle
         
         logger.info(f"Resolving handle for channel: {channel_id}")
-        
+
+        # First try the YouTube Data API if available
+        api_handle, api_channel_name = self._resolve_handle_via_api(channel_id)
+        if api_handle:
+            self.db.cache_handle(channel_id, api_handle, api_channel_name)
+            return api_handle
+
+        # Fall back to HTML scraping if API didn't succeed
+        html_handle, html_channel_name = self._resolve_handle_via_html(channel_id)
+        if html_handle:
+            self.db.cache_handle(channel_id, html_handle, html_channel_name)
+            return html_handle
+
+        logger.warning(f"Could not resolve handle for channel: {channel_id}")
+        return None
+
+    def _resolve_handle_via_api(self, channel_id: str) -> tuple[Optional[str], Optional[str]]:
+        """Attempt to resolve a channel handle using the YouTube Data API."""
+        api_key = getattr(settings, 'YOUTUBE_API_KEY', '')
+        if not api_key:
+            logger.debug("YouTube API key not configured; skipping API handle resolution")
+            return None, None
+
+        params = {
+            'part': 'snippet',
+            'id': channel_id,
+            'fields': 'items/snippet/customUrl,items/snippet/title',
+            'key': api_key
+        }
+
         try:
-            # Try multiple approaches to find the handle
+            response = requests.get(self._CHANNELS_API_URL, params=params, timeout=10)
+            if response.status_code != 200:
+                logger.warning(
+                    "YouTube API request failed for channel %s: %s %s",
+                    channel_id,
+                    response.status_code,
+                    response.text[:200]
+                )
+                return None, None
+
+            data = response.json()
+            items = data.get('items', [])
+            if not items:
+                logger.debug("YouTube API returned no items for channel %s", channel_id)
+                return None, None
+
+            snippet = items[0].get('snippet', {})
+            custom_url = snippet.get('customUrl')
+            channel_name = snippet.get('title')
+
+            if custom_url:
+                handle = f"@{custom_url.lstrip('@')}"
+                logger.info(f"Found handle via YouTube API: {handle}")
+                return handle, channel_name
+
+            logger.debug(
+                "YouTube API response for channel %s missing customUrl field",
+                channel_id
+            )
+            return None, channel_name
+
+        except requests.exceptions.RequestException as exc:
+            logger.error("YouTube API error resolving handle for %s: %s", channel_id, exc)
+            return None, None
+        except (ValueError, json.JSONDecodeError) as exc:
+            logger.error("Failed to parse YouTube API response for %s: %s", channel_id, exc)
+            return None, None
+
+    def _resolve_handle_via_html(self, channel_id: str) -> tuple[Optional[str], Optional[str]]:
+        """Fallback method to resolve a channel handle by scraping the channel page."""
+        try:
             handle = None
             channel_name = None
-            
-            # Method 1: Check channel page for canonical URL or handle
+
             channel_url = f"https://www.youtube.com/channel/{channel_id}"
             response = requests.get(channel_url, timeout=15, headers={
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             })
-            
-            if response.status_code == 200:
-                content = response.text
-                
-                # Look for canonical URL with handle
-                import re
-                canonical_match = re.search(r'<link rel="canonical" href="https://www\.youtube\.com/@([^"]+)"', content)
-                if canonical_match:
-                    handle = f"@{canonical_match.group(1)}"
-                    logger.info(f"Found handle via canonical URL: {handle}")
-                
-                # Look for channel name while we're here
-                name_match = re.search(r'<meta property="og:title" content="([^"]+)"', content)
-                if name_match:
-                    channel_name = name_match.group(1)
-                
-                # Alternative: Look for handle in page data
-                if not handle:
-                    handle_match = re.search(r'"webCommandMetadata":{\"url\":\"/(@[^/\"]+)', content)
-                    if handle_match:
-                        handle = handle_match.group(1)
-                        logger.info(f"Found handle via web command metadata: {handle}")
-                
-                # Another alternative: Look for handle in navigation data
-                if not handle:
-                    nav_match = re.search(r'"canonicalChannelUrl":"https://www\.youtube\.com/(@[^"]+)"', content)
-                    if nav_match:
-                        handle = nav_match.group(1)
-                        logger.info(f"Found handle via navigation data: {handle}")
-            
-            # Method 2: Try redirecting from /c/ or /user/ formats if they exist
+
+            if response.status_code != 200:
+                logger.warning(
+                    "Channel page request failed for %s with status %s",
+                    channel_id,
+                    response.status_code
+                )
+                return None, None
+
+            content = response.text
+
+            canonical_match = re.search(r'<link rel="canonical" href="https://www\.youtube\.com/@([^"]+)"', content)
+            if canonical_match:
+                handle = f"@{canonical_match.group(1)}"
+                logger.info(f"Found handle via canonical URL: {handle}")
+
+            name_match = re.search(r'<meta property="og:title" content="([^"]+)"', content)
+            if name_match:
+                channel_name = name_match.group(1)
+
             if not handle:
-                logger.debug(f"Direct method failed, trying alternative approaches for {channel_id}")
-                
-                # Sometimes channels have custom URLs, but we can't easily guess them
-                # We'll rely on the direct channel page approach above
-            
-            if handle:
-                # Cache the result
-                self.db.cache_handle(channel_id, handle, channel_name)
-                return handle
-            else:
-                logger.warning(f"Could not resolve handle for channel: {channel_id}")
-                return None
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Network error resolving handle for {channel_id}: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"Unexpected error resolving handle for {channel_id}: {e}")
-            return None
+                handle_match = re.search(r'"webCommandMetadata":\{"url":"/(@[^/\"]+)', content)
+                if handle_match:
+                    handle = handle_match.group(1)
+                    logger.info(f"Found handle via web command metadata: {handle}")
+
+            if not handle:
+                nav_match = re.search(r'"canonicalChannelUrl":"https://www\.youtube\.com/(@[^\"]+)"', content)
+                if nav_match:
+                    handle = nav_match.group(1)
+                    logger.info(f"Found handle via navigation data: {handle}")
+
+            if not handle:
+                base_url_match = re.search(r'"canonicalBaseUrl":"/(@[^"\\]+)"', content)
+                if base_url_match:
+                    handle = base_url_match.group(1)
+                    logger.info(f"Found handle via canonicalBaseUrl: {handle}")
+
+            if not handle:
+                vanity_match = re.search(r'"vanityChannelUrl":"https://www\.youtube\.com/(@[^\"]+)"', content)
+                if vanity_match:
+                    handle = vanity_match.group(1)
+                    logger.info(f"Found handle via vanityChannelUrl: {handle}")
+
+            if not handle:
+                loose_match = re.search(r'(@[A-Za-z0-9_\.\-]+)"[^\n]+channelId":"' + re.escape(channel_id) + '"', content)
+                if loose_match:
+                    handle = loose_match.group(1)
+                    logger.info(f"Found handle via loose pattern: {handle}")
+
+            return handle, channel_name
+
+        except requests.exceptions.RequestException as exc:
+            logger.error("Network error resolving handle for %s: %s", channel_id, exc)
+            return None, None
+        except Exception as exc:
+            logger.error("Unexpected error resolving handle for %s: %s", channel_id, exc)
+            return None, None
     
     def scrape_channel_posts(self, channel_id: str, limit: int = 10) -> List[CommunityPost]:
         """
@@ -441,6 +547,7 @@ class CommunityPostScraper:
                 # Run yp-dl command without --folder-path to avoid the path separator bug
                 cmd = [
                     'yp-dl',
+                    '--reverse',
                     '--verbose',
                     channel_url
                 ]
@@ -483,6 +590,7 @@ class CommunityPostScraper:
                     try:
                         posts_data = self._load_json_file(json_file)
                         if posts_data:
+                            # With --reverse, yp-dl returns newest-first; slice takes newest items
                             for post_data in posts_data[:limit]:  # Limit the number of posts
                                 try:
                                     post = self._parse_yp_dl_post_data(post_data, channel_id)
@@ -564,20 +672,7 @@ class CommunityPostScraper:
             post_id = f"community_{content_hash}"
         
         # Get channel name - try to use cached name from handle resolution
-        cached_handle_data = None
-        try:
-            with sqlite3.connect(self.db.db_path) as conn:
-                cursor = conn.execute("""
-                    SELECT channel_name FROM channel_handles 
-                    WHERE channel_id = ? AND channel_name IS NOT NULL
-                """, (channel_id,))
-                result = cursor.fetchone()
-                if result:
-                    channel_name = result[0]
-                else:
-                    channel_name = f"Channel {channel_id}"
-        except Exception:
-            channel_name = f"Channel {channel_id}"
+        channel_name = self.db.get_cached_channel_name(channel_id) or f"Channel {channel_id}"
         
         # Parse images (yp-dl format: images field can be null or array)
         image_urls = []
@@ -698,11 +793,11 @@ class CommunityPostScraper:
                 # Default to current time if can't parse
                 timestamp = now
             
-            return timestamp.isoformat() + 'Z'
+            return timestamp.isoformat()
             
         except Exception as e:
             logger.error(f"Error parsing time_since '{time_since}': {e}")
-            return datetime.now(timezone.utc).isoformat() + 'Z'
+            return datetime.now(timezone.utc).isoformat()
     
 
     

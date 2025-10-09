@@ -1,7 +1,10 @@
+gunicorn==23.0.0
 flask==3.1.2
 requests==2.32.5
 feedparser==6.0.12
 python-dotenv==1.1.1
-gunicorn==23.0.0
 waitress==3.0.2
 yp-dl==0.9.18
+sqlalchemy==2.0.43
+psycopg[binary]==3.2.10
+pymysql==1.1.2
