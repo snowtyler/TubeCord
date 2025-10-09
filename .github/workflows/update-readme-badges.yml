@@ -1,0 +1,47 @@
+name: Update README badges
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'VERSION'
+      - 'PYTHON_SUPPORT'
+      - '.github/scripts/update_readme_badges.py'
+      - '.github/workflows/update-readme-badges.yml'
+      - 'README.md'
+  release:
+    types:
+      - published
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Update README badges
+        run: python .github/scripts/update_readme_badges.py
+
+      - name: Commit and push changes
+        run: |
+          if git diff --quiet; then
+            echo "No README updates required"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add README.md
+            git commit -m "chore: sync README badges"
+            git push
+          fi
