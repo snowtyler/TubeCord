@@ -198,7 +198,7 @@ class YouTubeNotification:
                         logger.info("Detected completed livestream via lifeCycleStatus")
                         return NotificationType.LIVESTREAM_COMPLETED
 
-                    if upload_status == 'processed':
+                    if upload_status == 'processed' and actual_start_time:
                         logger.info("Detected completed livestream via uploadStatus processed")
                         return NotificationType.LIVESTREAM_COMPLETED
 
@@ -228,7 +228,7 @@ class YouTubeNotification:
                         logger.info("Stream ended but broadcast content still shows 'live'")
                         return NotificationType.LIVESTREAM_COMPLETED
 
-                    if life_cycle_status in {'complete', 'completed'} or upload_status == 'processed':
+                    if life_cycle_status in {'complete', 'completed'} or (upload_status == 'processed' and actual_start_time):
                         logger.info("Broadcast marked complete despite 'live' flag")
                         return NotificationType.LIVESTREAM_COMPLETED
 
