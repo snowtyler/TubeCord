@@ -99,6 +99,10 @@ class YouTubeNotification:
                 'key': api_key,
                 'fields': 'items(snippet(liveBroadcastContent),liveStreamingDetails(actualStartTime,actualEndTime,scheduledStartTime,scheduledEndTime))'
             }
+            # Fixed delay to allow YouTube to populate API state after WebSub push
+            import time
+            logger.debug("Delaying 3s before YouTube API fetch for %s", video_id)
+            time.sleep(3)
             logger.debug("Fetching video state from YouTube API for %s", video_id)
             resp = requests.get(api_url, params=params, timeout=10)
             if resp.status_code != 200:
