@@ -21,6 +21,7 @@ class Settings:
     
     # YouTube Configuration
     YOUTUBE_CHANNEL_ID: str = os.getenv('YOUTUBE_CHANNEL_ID', '')
+    YOUTUBE_API_KEY: str = os.getenv('YOUTUBE_API_KEY', '').strip()
     
     # Discord Configuration - Per Content Type
     # Upload notifications

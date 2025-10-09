@@ -15,6 +15,9 @@ import hashlib
 import subprocess
 import tempfile
 import requests
+import re
+
+from app.config.settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -321,6 +324,8 @@ class CommunityPostDatabase:
 class CommunityPostScraper:
     """Main class for scraping YouTube community posts using yp-dl CLI tool."""
     
+    _CHANNELS_API_URL = "https://youtube.googleapis.com/youtube/v3/channels"
+
     def __init__(self, db_path: str = "community_posts.db"):
         self.db = CommunityPostDatabase(db_path)
         self.yp_dl_available = self._check_yp_dl_availability()
@@ -354,68 +359,143 @@ class CommunityPostScraper:
             return cached_handle
         
         logger.info(f"Resolving handle for channel: {channel_id}")
-        
+
+        # First try the YouTube Data API if available
+        api_handle, api_channel_name = self._resolve_handle_via_api(channel_id)
+        if api_handle:
+            self.db.cache_handle(channel_id, api_handle, api_channel_name)
+            return api_handle
+
+        # Fall back to HTML scraping if API didn't succeed
+        html_handle, html_channel_name = self._resolve_handle_via_html(channel_id)
+        if html_handle:
+            self.db.cache_handle(channel_id, html_handle, html_channel_name)
+            return html_handle
+
+        logger.warning(f"Could not resolve handle for channel: {channel_id}")
+        return None
+
+    def _resolve_handle_via_api(self, channel_id: str) -> tuple[Optional[str], Optional[str]]:
+        """Attempt to resolve a channel handle using the YouTube Data API."""
+        api_key = getattr(settings, 'YOUTUBE_API_KEY', '')
+        if not api_key:
+            logger.debug("YouTube API key not configured; skipping API handle resolution")
+            return None, None
+
+        params = {
+            'part': 'snippet',
+            'id': channel_id,
+            'fields': 'items/snippet/customUrl,items/snippet/title',
+            'key': api_key
+        }
+
         try:
-            # Try multiple approaches to find the handle
+            response = requests.get(self._CHANNELS_API_URL, params=params, timeout=10)
+            if response.status_code != 200:
+                logger.warning(
+                    "YouTube API request failed for channel %s: %s %s",
+                    channel_id,
+                    response.status_code,
+                    response.text[:200]
+                )
+                return None, None
+
+            data = response.json()
+            items = data.get('items', [])
+            if not items:
+                logger.debug("YouTube API returned no items for channel %s", channel_id)
+                return None, None
+
+            snippet = items[0].get('snippet', {})
+            custom_url = snippet.get('customUrl')
+            channel_name = snippet.get('title')
+
+            if custom_url:
+                handle = f"@{custom_url.lstrip('@')}"
+                logger.info(f"Found handle via YouTube API: {handle}")
+                return handle, channel_name
+
+            logger.debug(
+                "YouTube API response for channel %s missing customUrl field",
+                channel_id
+            )
+            return None, channel_name
+
+        except requests.exceptions.RequestException as exc:
+            logger.error("YouTube API error resolving handle for %s: %s", channel_id, exc)
+            return None, None
+        except (ValueError, json.JSONDecodeError) as exc:
+            logger.error("Failed to parse YouTube API response for %s: %s", channel_id, exc)
+            return None, None
+
+    def _resolve_handle_via_html(self, channel_id: str) -> tuple[Optional[str], Optional[str]]:
+        """Fallback method to resolve a channel handle by scraping the channel page."""
+        try:
             handle = None
             channel_name = None
-            
-            # Method 1: Check channel page for canonical URL or handle
+
             channel_url = f"https://www.youtube.com/channel/{channel_id}"
             response = requests.get(channel_url, timeout=15, headers={
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             })
-            
-            if response.status_code == 200:
-                content = response.text
-                
-                # Look for canonical URL with handle
-                import re
-                canonical_match = re.search(r'<link rel="canonical" href="https://www\.youtube\.com/@([^"]+)"', content)
-                if canonical_match:
-                    handle = f"@{canonical_match.group(1)}"
-                    logger.info(f"Found handle via canonical URL: {handle}")
-                
-                # Look for channel name while we're here
-                name_match = re.search(r'<meta property="og:title" content="([^"]+)"', content)
-                if name_match:
-                    channel_name = name_match.group(1)
-                
-                # Alternative: Look for handle in page data
-                if not handle:
-                    handle_match = re.search(r'"webCommandMetadata":{\"url\":\"/(@[^/\"]+)', content)
-                    if handle_match:
-                        handle = handle_match.group(1)
-                        logger.info(f"Found handle via web command metadata: {handle}")
-                
-                # Another alternative: Look for handle in navigation data
-                if not handle:
-                    nav_match = re.search(r'"canonicalChannelUrl":"https://www\.youtube\.com/(@[^"]+)"', content)
-                    if nav_match:
-                        handle = nav_match.group(1)
-                        logger.info(f"Found handle via navigation data: {handle}")
-            
-            # Method 2: Try redirecting from /c/ or /user/ formats if they exist
+
+            if response.status_code != 200:
+                logger.warning(
+                    "Channel page request failed for %s with status %s",
+                    channel_id,
+                    response.status_code
+                )
+                return None, None
+
+            content = response.text
+
+            canonical_match = re.search(r'<link rel="canonical" href="https://www\.youtube\.com/@([^"]+)"', content)
+            if canonical_match:
+                handle = f"@{canonical_match.group(1)}"
+                logger.info(f"Found handle via canonical URL: {handle}")
+
+            name_match = re.search(r'<meta property="og:title" content="([^"]+)"', content)
+            if name_match:
+                channel_name = name_match.group(1)
+
             if not handle:
-                logger.debug(f"Direct method failed, trying alternative approaches for {channel_id}")
-                
-                # Sometimes channels have custom URLs, but we can't easily guess them
-                # We'll rely on the direct channel page approach above
-            
-            if handle:
-                # Cache the result
-                self.db.cache_handle(channel_id, handle, channel_name)
-                return handle
-            else:
-                logger.warning(f"Could not resolve handle for channel: {channel_id}")
-                return None
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Network error resolving handle for {channel_id}: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"Unexpected error resolving handle for {channel_id}: {e}")
-            return None
+                handle_match = re.search(r'"webCommandMetadata":\{"url":"/(@[^/\"]+)', content)
+                if handle_match:
+                    handle = handle_match.group(1)
+                    logger.info(f"Found handle via web command metadata: {handle}")
+
+            if not handle:
+                nav_match = re.search(r'"canonicalChannelUrl":"https://www\.youtube\.com/(@[^\"]+)"', content)
+                if nav_match:
+                    handle = nav_match.group(1)
+                    logger.info(f"Found handle via navigation data: {handle}")
+
+            if not handle:
+                base_url_match = re.search(r'"canonicalBaseUrl":"/(@[^"\\]+)"', content)
+                if base_url_match:
+                    handle = base_url_match.group(1)
+                    logger.info(f"Found handle via canonicalBaseUrl: {handle}")
+
+            if not handle:
+                vanity_match = re.search(r'"vanityChannelUrl":"https://www\.youtube\.com/(@[^\"]+)"', content)
+                if vanity_match:
+                    handle = vanity_match.group(1)
+                    logger.info(f"Found handle via vanityChannelUrl: {handle}")
+
+            if not handle:
+                loose_match = re.search(r'(@[A-Za-z0-9_\.\-]+)"[^\n]+channelId":"' + re.escape(channel_id) + '"', content)
+                if loose_match:
+                    handle = loose_match.group(1)
+                    logger.info(f"Found handle via loose pattern: {handle}")
+
+            return handle, channel_name
+
+        except requests.exceptions.RequestException as exc:
+            logger.error("Network error resolving handle for %s: %s", channel_id, exc)
+            return None, None
+        except Exception as exc:
+            logger.error("Unexpected error resolving handle for %s: %s", channel_id, exc)
+            return None, None
     
     def scrape_channel_posts(self, channel_id: str, limit: int = 10) -> List[CommunityPost]:
         """
