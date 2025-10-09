@@ -177,6 +177,11 @@ class YouTubeNotification:
                         data['actual_start_time'] = actual_start_time
                     
                     if actual_start_time and not actual_end_time:
+                        # Some streams flip to broadcast "none" as soon as they end
+                        # before YouTube sets actualEndTime. Use broadcast state to avoid duplicates.
+                        if live_broadcast_content in ('none', 'completed'):
+                            logger.info("Detected completed livestream (broadcast content shows none/completed)")
+                            return NotificationType.LIVESTREAM_COMPLETED
                         # Currently live
                         logger.info(f"Detected LIVE stream: {data.get('title', 'Unknown')}")
                         return NotificationType.LIVESTREAM_LIVE
