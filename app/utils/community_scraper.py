@@ -5,7 +5,6 @@ Handles fetching, processing, and storing community posts.
 
 import logging
 import json
-import sqlite3
 import os
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
@@ -17,9 +16,61 @@ import tempfile
 import requests
 import re
 
+from sqlalchemy import (
+    Boolean,
+    Column,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    Text,
+    delete,
+    select,
+    update,
+    Index,
+)
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.orm import Session
+from sqlalchemy.engine import Engine
+
 from app.config.settings import settings
+from app.db import get_engine
 
 logger = logging.getLogger(__name__)
+
+
+metadata = MetaData()
+
+community_posts_table = Table(
+    "community_posts",
+    metadata,
+    Column("post_id", String(255), primary_key=True),
+    Column("channel_id", String(255), nullable=False),
+    Column("channel_name", String(255), nullable=False),
+    Column("content", Text, nullable=False),
+    Column("image_urls", Text),
+    Column("video_attachments", Text),
+    Column("poll_data", Text),
+    Column("published_time", String(64), nullable=False),
+    Column("like_count", Integer),
+    Column("url", Text, nullable=False),
+    Column("content_hash", String(64), nullable=False),
+    Column("scraped_at", String(64), nullable=False),
+    Column("notified", Boolean, nullable=False, default=False),
+)
+
+channel_handles_table = Table(
+    "channel_handles",
+    metadata,
+    Column("channel_id", String(255), primary_key=True),
+    Column("handle", String(255), nullable=False),
+    Column("channel_name", String(255)),
+    Column("resolved_at", String(64), nullable=False),
+    Column("last_verified", String(64), nullable=False),
+)
+
+Index('idx_channel_published', community_posts_table.c.channel_id, community_posts_table.c.published_time)
+Index('idx_notified', community_posts_table.c.notified, community_posts_table.c.published_time)
 
 
 @dataclass
@@ -60,265 +111,217 @@ class CommunityPost:
 
 
 class CommunityPostDatabase:
-    """SQLite database for storing and tracking community posts."""
-    
-    def __init__(self, db_path: str = "community_posts.db"):
-        self.db_path = db_path
+    """Database helper for storing and tracking community posts."""
+
+    def __init__(self, database_url: Optional[str] = None, *, engine: Optional[Engine] = None):
+        self.database_url = database_url or settings.DATABASE_URL
+        self.engine = engine or get_engine(self.database_url)
         self._init_database()
-    
-    def _init_database(self):
-        """Initialize the database schema."""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS community_posts (
-                    post_id TEXT PRIMARY KEY,
-                    channel_id TEXT NOT NULL,
-                    channel_name TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    image_urls TEXT,
-                    video_attachments TEXT,
-                    poll_data TEXT,
-                    published_time TEXT NOT NULL,
-                    like_count INTEGER,
-                    url TEXT NOT NULL,
-                    content_hash TEXT NOT NULL,
-                    scraped_at TEXT NOT NULL,
-                    notified BOOLEAN DEFAULT FALSE
-                )
-            """)
-            
-            # Create table for caching channel handles
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS channel_handles (
-                    channel_id TEXT PRIMARY KEY,
-                    handle TEXT NOT NULL,
-                    channel_name TEXT,
-                    resolved_at TEXT NOT NULL,
-                    last_verified TEXT NOT NULL
-                )
-            """)
-            
-            # Create index for faster queries
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_channel_published 
-                ON community_posts(channel_id, published_time DESC)
-            """)
-            
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_notified 
-                ON community_posts(notified, published_time DESC)
-            """)
-            
-            # Create table for caching channel handles
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS channel_handles (
-                    channel_id TEXT PRIMARY KEY,
-                    handle TEXT NOT NULL,
-                    channel_name TEXT,
-                    resolved_at TEXT NOT NULL,
-                    last_verified TEXT NOT NULL
-                )
-            """)
-    
+
+    def _init_database(self) -> None:
+        """Ensure database schema exists."""
+        try:
+            metadata.create_all(self.engine, checkfirst=True)
+        except SQLAlchemyError as exc:
+            logger.error("Database initialization error: %s", exc)
+            raise
+
     def store_post(self, post: CommunityPost) -> bool:
-        """
-        Store a community post in the database.
-        
-        Args:
-            post: CommunityPost to store
-            
-        Returns:
-            True if stored successfully, False if already exists
-        """
+        """Store a community post in the database."""
+        record = {
+            "post_id": post.post_id,
+            "channel_id": post.channel_id,
+            "channel_name": post.channel_name,
+            "content": post.content,
+            "image_urls": json.dumps(post.image_urls),
+            "video_attachments": json.dumps(post.video_attachments),
+            "poll_data": json.dumps(post.poll_data) if post.poll_data else None,
+            "published_time": post.published_time,
+            "like_count": post.like_count,
+            "url": post.url,
+            "content_hash": post.content_hash,
+            "scraped_at": datetime.now(timezone.utc).isoformat(),
+            "notified": False,
+        }
+
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute("""
-                    INSERT OR IGNORE INTO community_posts (
-                        post_id, channel_id, channel_name, content, image_urls,
-                        video_attachments, poll_data, published_time, like_count,
-                        url, content_hash, scraped_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    post.post_id,
-                    post.channel_id,
-                    post.channel_name,
-                    post.content,
-                    json.dumps(post.image_urls),
-                    json.dumps(post.video_attachments),
-                    json.dumps(post.poll_data) if post.poll_data else None,
-                    post.published_time,
-                    post.like_count,
-                    post.url,
-                    post.content_hash,
-                    datetime.now(timezone.utc).isoformat()
-                ))
-                
-                # Return True if a row was inserted
-                return conn.total_changes > 0
-                
-        except sqlite3.Error as e:
-            logger.error(f"Database error storing post {post.post_id}: {e}")
+            with Session(self.engine) as session:
+                try:
+                    session.execute(community_posts_table.insert().values(**record))
+                    session.commit()
+                    return True
+                except IntegrityError:
+                    session.rollback()
+                    return False
+        except SQLAlchemyError as exc:
+            logger.error("Database error storing post %s: %s", post.post_id, exc)
             return False
-    
-    def get_unnotified_posts(self, channel_id: str = None) -> List[CommunityPost]:
-        """
-        Get community posts that haven't been notified yet.
-        
-        Args:
-            channel_id: Optional channel ID to filter by
-            
-        Returns:
-            List of unnotified CommunityPost objects
-        """
+
+    def get_unnotified_posts(self, channel_id: Optional[str] = None) -> List[CommunityPost]:
+        """Get community posts that haven't been notified yet."""
+        stmt = select(community_posts_table).where(community_posts_table.c.notified.is_(False))
+
+        if channel_id:
+            stmt = stmt.where(community_posts_table.c.channel_id == channel_id)
+
+        stmt = stmt.order_by(community_posts_table.c.published_time.desc())
+
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                if channel_id:
-                    cursor = conn.execute("""
-                        SELECT * FROM community_posts 
-                        WHERE channel_id = ? AND notified = FALSE 
-                        ORDER BY published_time DESC
-                    """, (channel_id,))
-                else:
-                    cursor = conn.execute("""
-                        SELECT * FROM community_posts 
-                        WHERE notified = FALSE 
-                        ORDER BY published_time DESC
-                    """)
-                
-                posts = []
-                for row in cursor.fetchall():
-                    post = self._row_to_post(row)
-                    posts.append(post)
-                
-                return posts
-                
-        except sqlite3.Error as e:
-            logger.error(f"Database error getting unnotified posts: {e}")
+            with Session(self.engine) as session:
+                rows = session.execute(stmt).mappings().all()
+                return [self._row_to_post(row) for row in rows]
+        except SQLAlchemyError as exc:
+            logger.error("Database error getting unnotified posts: %s", exc)
             return []
-    
+
     def mark_notified(self, post_id: str) -> bool:
-        """
-        Mark a post as notified.
-        
-        Args:
-            post_id: ID of the post to mark as notified
-            
-        Returns:
-            True if marked successfully
-        """
+        """Mark a post as notified."""
+        stmt = (
+            update(community_posts_table)
+            .where(community_posts_table.c.post_id == post_id)
+            .values(notified=True)
+        )
+
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute("""
-                    UPDATE community_posts 
-                    SET notified = TRUE 
-                    WHERE post_id = ?
-                """, (post_id,))
-                
-                return conn.total_changes > 0
-                
-        except sqlite3.Error as e:
-            logger.error(f"Database error marking post {post_id} as notified: {e}")
+            with Session(self.engine) as session:
+                result = session.execute(stmt)
+                session.commit()
+                return result.rowcount > 0 if result.rowcount is not None else True
+        except SQLAlchemyError as exc:
+            logger.error("Database error marking post %s as notified: %s", post_id, exc)
             return False
-    
-    def _row_to_post(self, row) -> CommunityPost:
+
+    def _row_to_post(self, row: Dict[str, Any]) -> CommunityPost:
         """Convert database row to CommunityPost object."""
         return CommunityPost(
-            post_id=row[0],
-            channel_id=row[1],
-            channel_name=row[2],
-            content=row[3],
-            image_urls=json.loads(row[4]) if row[4] else [],
-            video_attachments=json.loads(row[5]) if row[5] else [],
-            poll_data=json.loads(row[6]) if row[6] else None,
-            published_time=row[7],
-            like_count=row[8],
-            url=row[9]
+            post_id=row["post_id"],
+            channel_id=row["channel_id"],
+            channel_name=row["channel_name"],
+            content=row["content"],
+            image_urls=json.loads(row["image_urls"]) if row["image_urls"] else [],
+            video_attachments=json.loads(row["video_attachments"]) if row["video_attachments"] else [],
+            poll_data=json.loads(row["poll_data"]) if row["poll_data"] else None,
+            published_time=row["published_time"],
+            like_count=row["like_count"],
+            url=row["url"],
         )
-    
-    def cleanup_old_posts(self, days: int = 30):
-        """
-        Clean up old posts from the database.
-        
-        Args:
-            days: Number of days to keep posts
-        """
+
+    def cleanup_old_posts(self, days: int = 30) -> None:
+        """Clean up old posts from the database."""
         cutoff_date = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-        
+
+        stmt = delete(community_posts_table).where(
+            community_posts_table.c.published_time < cutoff_date,
+            community_posts_table.c.notified.is_(True),
+        )
+
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.execute("""
-                    DELETE FROM community_posts 
-                    WHERE published_time < ? AND notified = TRUE
-                """, (cutoff_date,))
-                
-                deleted_count = cursor.rowcount
-                if deleted_count > 0:
-                    logger.info(f"Cleaned up {deleted_count} old community posts")
-                    
-        except sqlite3.Error as e:
-            logger.error(f"Database error during cleanup: {e}")
-    
+            with Session(self.engine) as session:
+                result = session.execute(stmt)
+                session.commit()
+                deleted = result.rowcount or 0
+                if deleted > 0:
+                    logger.info("Cleaned up %s old community posts", deleted)
+        except SQLAlchemyError as exc:
+            logger.error("Database error during cleanup: %s", exc)
+
     def get_cached_handle(self, channel_id: str) -> Optional[str]:
         """Get cached channel handle from database."""
+        stmt = select(
+            channel_handles_table.c.handle,
+            channel_handles_table.c.last_verified,
+        ).where(channel_handles_table.c.channel_id == channel_id)
+
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.execute("""
-                    SELECT handle, last_verified FROM channel_handles 
-                    WHERE channel_id = ?
-                """, (channel_id,))
-                
-                result = cursor.fetchone()
-                if result:
-                    handle, last_verified = result
-                    # Check if cache is still valid (30 days)
-                    candidate_values = [last_verified]
-                    if last_verified.endswith('Z'):
-                        candidate_values.append(last_verified[:-1] + '+00:00')
-                    if last_verified.endswith('+00:00Z'):
-                        candidate_values.append(last_verified[:-1])
-                    if last_verified.endswith('+00:00+00:00'):
-                        candidate_values.append(last_verified[:-6])
-
-                    last_verified_dt = None
-                    for candidate in candidate_values:
-                        try:
-                            last_verified_dt = datetime.fromisoformat(candidate)
-                            break
-                        except ValueError:
-                            continue
-
-                    if not last_verified_dt:
-                        logger.warning(
-                            "Invalid cached timestamp for channel %s, discarding handle cache",
-                            channel_id
-                        )
-                        return None
-                    if (datetime.now(timezone.utc) - last_verified_dt).days < 30:
-                        return handle
-                    else:
-                        logger.debug(f"Cached handle for {channel_id} is stale, will refresh")
-                
-                return None
-        except sqlite3.Error as e:
-            logger.error(f"Database error getting cached handle: {e}")
+            with Session(self.engine) as session:
+                result = session.execute(stmt).first()
+        except SQLAlchemyError as exc:
+            logger.error("Database error getting cached handle: %s", exc)
             return None
-    
-    def cache_handle(self, channel_id: str, handle: str, channel_name: str = None) -> bool:
+
+        if not result:
+            return None
+
+        handle, last_verified = result
+        candidate_values = [last_verified]
+
+        if last_verified.endswith('Z'):
+            candidate_values.append(last_verified[:-1] + '+00:00')
+        if last_verified.endswith('+00:00Z'):
+            candidate_values.append(last_verified[:-1])
+        if last_verified.endswith('+00:00+00:00'):
+            candidate_values.append(last_verified[:-6])
+
+        last_verified_dt = None
+        for candidate in candidate_values:
+            try:
+                last_verified_dt = datetime.fromisoformat(candidate)
+                break
+            except ValueError:
+                continue
+
+        if not last_verified_dt:
+            logger.warning(
+                "Invalid cached timestamp for channel %s, discarding handle cache",
+                channel_id,
+            )
+            return None
+
+        if (datetime.now(timezone.utc) - last_verified_dt).days < 30:
+            return handle
+
+        logger.debug("Cached handle for %s is stale, will refresh", channel_id)
+        return None
+
+    def cache_handle(self, channel_id: str, handle: str, channel_name: Optional[str] = None) -> bool:
         """Cache a channel handle in the database."""
+        now = datetime.now(timezone.utc).isoformat()
+        insert_stmt = channel_handles_table.insert().values(
+            channel_id=channel_id,
+            handle=handle,
+            channel_name=channel_name,
+            resolved_at=now,
+            last_verified=now,
+        )
+
         try:
-            now = datetime.now(timezone.utc).isoformat()
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute("""
-                    INSERT OR REPLACE INTO channel_handles 
-                    (channel_id, handle, channel_name, resolved_at, last_verified)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (channel_id, handle, channel_name, now, now))
-                
-                logger.info(f"Cached handle for {channel_id}: {handle}")
+            with Session(self.engine) as session:
+                try:
+                    session.execute(insert_stmt)
+                    session.commit()
+                except IntegrityError:
+                    session.rollback()
+                    update_stmt = (
+                        update(channel_handles_table)
+                        .where(channel_handles_table.c.channel_id == channel_id)
+                        .values(
+                            handle=handle,
+                            channel_name=channel_name,
+                            last_verified=now,
+                            resolved_at=now,
+                        )
+                    )
+                    session.execute(update_stmt)
+                    session.commit()
+                logger.info("Cached handle for %s: %s", channel_id, handle)
                 return True
-        except sqlite3.Error as e:
-            logger.error(f"Database error caching handle: {e}")
+        except SQLAlchemyError as exc:
+            logger.error("Database error caching handle: %s", exc)
             return False
+
+    def get_cached_channel_name(self, channel_id: str) -> Optional[str]:
+        """Return cached channel name for a channel if available."""
+        stmt = select(channel_handles_table.c.channel_name).where(
+            channel_handles_table.c.channel_id == channel_id,
+            channel_handles_table.c.channel_name.isnot(None),
+        )
+
+        try:
+            with Session(self.engine) as session:
+                return session.execute(stmt).scalar_one_or_none()
+        except SQLAlchemyError as exc:
+            logger.error("Database error getting cached channel name: %s", exc)
+            return None
 
 
 class CommunityPostScraper:
@@ -326,8 +329,24 @@ class CommunityPostScraper:
     
     _CHANNELS_API_URL = "https://youtube.googleapis.com/youtube/v3/channels"
 
-    def __init__(self, db_path: str = "community_posts.db"):
-        self.db = CommunityPostDatabase(db_path)
+    def __init__(
+        self,
+        db_path: Optional[str] = None,
+        *,
+        database_url: Optional[str] = None,
+        engine: Optional[Engine] = None,
+    ):
+        if db_path and database_url:
+            raise ValueError("Provide either db_path or database_url, not both.")
+
+        resolved_url = database_url
+        if db_path:
+            if db_path.startswith("sqlite://"):
+                resolved_url = db_path
+            else:
+                resolved_url = f"sqlite:///{os.path.abspath(db_path).replace(os.sep, '/')}"
+
+        self.db = CommunityPostDatabase(database_url=resolved_url, engine=engine)
         self.yp_dl_available = self._check_yp_dl_availability()
     
     def _check_yp_dl_availability(self) -> bool:
@@ -664,20 +683,7 @@ class CommunityPostScraper:
             post_id = f"community_{content_hash}"
         
         # Get channel name - try to use cached name from handle resolution
-        cached_handle_data = None
-        try:
-            with sqlite3.connect(self.db.db_path) as conn:
-                cursor = conn.execute("""
-                    SELECT channel_name FROM channel_handles 
-                    WHERE channel_id = ? AND channel_name IS NOT NULL
-                """, (channel_id,))
-                result = cursor.fetchone()
-                if result:
-                    channel_name = result[0]
-                else:
-                    channel_name = f"Channel {channel_id}"
-        except Exception:
-            channel_name = f"Channel {channel_id}"
+        channel_name = self.db.get_cached_channel_name(channel_id) or f"Channel {channel_id}"
         
         # Parse images (yp-dl format: images field can be null or array)
         image_urls = []

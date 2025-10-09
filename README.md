@@ -9,7 +9,7 @@ TubeCord monitors a YouTube channel for uploads, livestreams, and community post
 - WebSub-compatible Flask webhook with automatic subscription renewal
 - Optional WebSub callback signing with shared secrets
 - Discord delivery through rich embeds and optional role mentions per content type
-- Community post polling backed by SQLite to avoid duplicate sends
+- Community post polling backed by a SQL datastore (SQLite by default) to avoid duplicate sends
 - Flexible message templates for uploads, livestreams, and community posts
 - Health and diagnostics endpoints for monitoring deployments
 
@@ -18,6 +18,7 @@ TubeCord monitors a YouTube channel for uploads, livestreams, and community post
 2. Webhook callbacks are validated, parsed, and converted into Discord payloads.
 3. The community post scheduler polls YouTube, records seen posts in SQLite, and emits new entries to Discord.
 4. Waitress serves the Flask app in production, keeping the webhook endpoint available.
+5. SQLAlchemy persists state to SQLite, PostgreSQL, MySQL, or MariaDB depending on `DATABASE_URL`.
 
 ## Prerequisites
 - Python 3.11 or newer
@@ -52,6 +53,17 @@ The app reads settings from environment variables (or `.env`). The most importan
 | `CALLBACK_PORT` | Optional port override when the externally visible port differs from the callback URL. |
 | `CALLBACK_SECRET` | Optional secret for verifying WebSub signatures. |
 | `PORT` | Local port for the Flask server (defaults to 8000). |
+| `DATABASE_URL` | SQLAlchemy connection string for the persistence layer (defaults to a local SQLite database under `data/`). |
+| `DATABASE_ECHO` | Set to `true` to enable SQLAlchemy statement logging for troubleshooting. |
+
+### Database Configuration
+TubeCord uses SQLAlchemy for persistence and supports multiple engines out of the box:
+- SQLite (default, file stored under `data/`)
+- PostgreSQL (`postgresql+psycopg://` DSN)
+- MySQL (`mysql+pymysql://` DSN)
+- MariaDB (`mariadb+mariadbconnector://` DSN)
+
+Set the `DATABASE_URL` environment variable to point at your external database. When left unset, the app falls back to the bundled SQLite file. Use `DATABASE_ECHO=true` if you need to inspect generated SQL during troubleshooting.
 
 ### Discord Routing
 Provide comma-separated lists to target multiple webhooks or roles, keeping the order aligned between URLs and role IDs.
