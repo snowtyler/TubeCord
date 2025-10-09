@@ -109,33 +109,23 @@ class YouTubeNotification:
     
     @staticmethod
     def _determine_notification_type(data: Dict[str, Any]) -> NotificationType:
-        """
-        Determine the type of notification using YouTube Data API v3.
-        
-        Args:
-            data: Parsed notification data
-            
-        Returns:
-            NotificationType enum value
-        """
-        import requests
+        """Determine the type of notification using the YouTube Data API v3."""
         import logging
-        
+        import requests
+
         logger = logging.getLogger(__name__)
-        
-        # Get YouTube API key from environment
+
         api_key = os.getenv('YOUTUBE_API_KEY')
         if not api_key:
             logger.warning("YOUTUBE_API_KEY not found, using metadata fallback for livestream detection")
             return YouTubeNotification._fallback_title_detection(data)
-        
+
         video_id = data.get('video_id')
         if not video_id:
             logger.warning("No video_id found in notification data")
             return NotificationType.UPLOAD
-        
+
         try:
-            # Use YouTube Data API v3 to get video details
             api_url = "https://www.googleapis.com/youtube/v3/videos"
             params = {
                 'part': 'liveStreamingDetails,snippet,status',
@@ -144,134 +134,116 @@ class YouTubeNotification:
                 'fields': (
                     'items('
                     'snippet(title,liveBroadcastContent),'
-                    'liveStreamingDetails(actualStartTime,actualEndTime,scheduledStartTime,scheduledEndTime),'
+                    'liveStreamingDetails(actualStartTime,actualEndTime,scheduledStartTime,scheduledEndTime,activeLiveChatId),'
                     'status(uploadStatus)'
                     ')'
                 )
             }
-            
-            logger.debug(f"Checking YouTube API for video: {video_id}")
+
+            logger.debug("Checking YouTube API for video: %s", video_id)
             response = requests.get(api_url, params=params, timeout=10)
-            
-            if response.status_code == 200:
-                api_data = response.json()
-                
-                if 'items' not in api_data or not api_data['items']:
-                    logger.warning(f"No video data found for video_id: {video_id}")
-                    return YouTubeNotification._fallback_title_detection(data)
-                
-                video_data = api_data['items'][0]
-                
-                # Check for live streaming details
-                live_details = video_data.get('liveStreamingDetails', {})
-                snippet = video_data.get('snippet', {})
-                status_info = video_data.get('status', {})
-                life_cycle_status = (status_info.get('lifeCycleStatus') or '').lower()
-                upload_status = (status_info.get('uploadStatus') or '').lower()
-                
-                # Check snippet for broadcast content first (more reliable for scheduled streams)
-                live_broadcast_content = snippet.get('liveBroadcastContent', 'none')
 
-                # Capture scheduled start/end times for downstream formatting
-                scheduled_start_time = live_details.get('scheduledStartTime') if live_details else None
-                if scheduled_start_time:
-                    data['scheduled_start_time'] = scheduled_start_time
-                scheduled_end_time = live_details.get('scheduledEndTime') if live_details else None
-                if scheduled_end_time:
-                    data['scheduled_end_time'] = scheduled_end_time
-
-                actual_start_time = live_details.get('actualStartTime') if live_details else None
-                actual_end_time = live_details.get('actualEndTime') if live_details else None
-
-                if actual_start_time:
-                    data['actual_start_time'] = actual_start_time
-
-                # Completed livestream signals take precedence
-                if actual_end_time:
-                    logger.info("Detected completed livestream via actualEndTime")
-                    return NotificationType.LIVESTREAM_COMPLETED
-
-                if life_cycle_status in {'complete', 'completed'}:
-                    logger.info("Detected completed livestream via lifeCycleStatus")
-                    return NotificationType.LIVESTREAM_COMPLETED
-
-                if upload_status == 'processed' and actual_start_time:
-                    logger.info("Detected completed livestream via uploadStatus processed")
-                    return NotificationType.LIVESTREAM_COMPLETED
-
-                if actual_start_time and live_broadcast_content in ('none', 'completed'):
-                    logger.info("Detected completed livestream (broadcast content shows none/completed)")
-                    return NotificationType.LIVESTREAM_COMPLETED
-
-                # Active livestream
-                if actual_start_time and not actual_end_time:
-                    logger.info(f"Detected LIVE stream: {data.get('title', 'Unknown')}")
-                    return NotificationType.LIVESTREAM_LIVE
-
-                # Upcoming livestream (scheduled but not yet live)
-                if live_broadcast_content == 'upcoming' or (scheduled_start_time and not actual_start_time):
-                    logger.info(
-                        "Detected scheduled livestream: %s (start: %s)",
-                        data.get('title', 'Unknown'),
-                        scheduled_start_time or 'unknown'
+            if response.status_code != 200:
+                if response.status_code == 403:
+                    logger.error("YouTube API quota exceeded or invalid API key")
+                else:
+                    logger.error(
+                        "YouTube API request failed: %s - %s",
+                        response.status_code,
+                        response.text
                     )
-                    return NotificationType.LIVESTREAM
-                
-                # Check broadcast content for additional information
-                # But prioritize liveStreamingDetails when they conflict
-                if live_broadcast_content == 'live':
-                    actual_start_time = live_details.get('actualStartTime')
-                    actual_end_time = live_details.get('actualEndTime')
+                return YouTubeNotification._fallback_title_detection(data)
 
-                    if actual_end_time:
-                        logger.info("Stream ended but broadcast content still shows 'live'")
-                        return NotificationType.LIVESTREAM_COMPLETED
+            api_data = response.json()
+            items = api_data.get('items', [])
+            if not items:
+                logger.warning("No video data found for video_id: %s", video_id)
+                return YouTubeNotification._fallback_title_detection(data)
 
-                    if life_cycle_status in {'complete', 'completed'} or (upload_status == 'processed' and actual_start_time):
-                        logger.info("Broadcast marked complete despite 'live' flag")
-                        return NotificationType.LIVESTREAM_COMPLETED
+            video_data = items[0]
+            live_details = video_data.get('liveStreamingDetails') or {}
+            snippet = video_data.get('snippet') or {}
+            status_info = video_data.get('status') or {}
 
-                    if actual_start_time:
-                        logger.info("Detected LIVE stream from broadcast content (confirmed by start time)")
-                        return NotificationType.LIVESTREAM_LIVE
+            live_broadcast_content = snippet.get('liveBroadcastContent', 'none')
+            upload_status = (status_info.get('uploadStatus') or '').lower()
 
-                    logger.info("Detected LIVE stream from broadcast content without start time")
-                    return NotificationType.LIVESTREAM_LIVE
-                    
-                elif live_broadcast_content == 'upcoming':
-                    logger.info(f"Detected scheduled livestream from broadcast content")
-                    return NotificationType.LIVESTREAM
+            scheduled_start_time = live_details.get('scheduledStartTime')
+            if scheduled_start_time:
+                data['scheduled_start_time'] = scheduled_start_time
 
-                # If there's no explicit upcoming flag but we know a schedule, honor it
-                if scheduled_start_time and not data.get('actual_start_time'):
-                    logger.info("Detected scheduled livestream via scheduled start time only")
-                    return NotificationType.LIVESTREAM
-                
-                # Check if this might be a completed livestream without liveStreamingDetails
-                # Look for livestream indicators in title to catch completed streams
-                title = data.get('title', '').lower()
-                live_indicators = ['live', 'streaming', 'stream', 'livestream', '🔴']
-                if any(indicator in title for indicator in live_indicators):
-                    # If it has livestream indicators but no active streaming details, it might be completed
-                    logger.info(f"Detected potentially completed livestream (will skip notification): {data.get('title', 'Unknown')}")
+            scheduled_end_time = live_details.get('scheduledEndTime')
+            if scheduled_end_time:
+                data['scheduled_end_time'] = scheduled_end_time
+
+            actual_start_time = live_details.get('actualStartTime')
+            actual_end_time = live_details.get('actualEndTime')
+            active_live_chat_id = live_details.get('activeLiveChatId')
+
+            if actual_start_time:
+                data['actual_start_time'] = actual_start_time
+
+            if actual_end_time:
+                logger.info("Detected completed livestream via actualEndTime")
+                return NotificationType.LIVESTREAM_COMPLETED
+
+            if upload_status == 'processed' and actual_start_time:
+                logger.info("Detected completed livestream via uploadStatus processed")
+                return NotificationType.LIVESTREAM_COMPLETED
+
+            if actual_start_time and live_broadcast_content in ('none', 'completed'):
+                logger.info("Detected completed livestream (broadcast content shows none/completed)")
+                return NotificationType.LIVESTREAM_COMPLETED
+
+            if actual_start_time and not active_live_chat_id and live_broadcast_content != 'live':
+                logger.info("Detected completed livestream (no active live chat)")
+                return NotificationType.LIVESTREAM_COMPLETED
+
+            if live_broadcast_content == 'upcoming' or (scheduled_start_time and not actual_start_time):
+                logger.info(
+                    "Detected scheduled livestream: %s (start: %s)",
+                    data.get('title', 'Unknown'),
+                    scheduled_start_time or 'unknown'
+                )
+                return NotificationType.LIVESTREAM
+
+            if actual_start_time and not actual_end_time:
+                if not active_live_chat_id and live_broadcast_content != 'live':
+                    logger.info("Detected completed livestream (started but chat offline)")
                     return NotificationType.LIVESTREAM_COMPLETED
-                
-                # If no livestream indicators found, it's a regular upload
-                logger.info(f"Detected regular upload: {data.get('title', 'Unknown')}")
-                return NotificationType.UPLOAD
-                
-            elif response.status_code == 403:
-                logger.error("YouTube API quota exceeded or invalid API key")
-                return YouTubeNotification._fallback_title_detection(data)
-            else:
-                logger.error(f"YouTube API request failed: {response.status_code} - {response.text}")
-                return YouTubeNotification._fallback_title_detection(data)
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Network error calling YouTube API: {e}")
+
+                logger.info("Detected LIVE stream: %s", data.get('title', 'Unknown'))
+                return NotificationType.LIVESTREAM_LIVE
+
+            if live_broadcast_content == 'live':
+                if not active_live_chat_id and actual_start_time:
+                    logger.info("Broadcast marked complete despite 'live' flag (no active chat)")
+                    return NotificationType.LIVESTREAM_COMPLETED
+
+                logger.info("Detected LIVE stream from broadcast content")
+                return NotificationType.LIVESTREAM_LIVE
+
+            if scheduled_start_time and not data.get('actual_start_time'):
+                logger.info("Detected scheduled livestream via scheduled start time only")
+                return NotificationType.LIVESTREAM
+
+            title = data.get('title', '').lower()
+            live_indicators = ['live', 'streaming', 'stream', 'livestream', '🔴']
+            if any(indicator in title for indicator in live_indicators):
+                logger.info(
+                    "Detected potentially completed livestream (will skip notification): %s",
+                    data.get('title', 'Unknown')
+                )
+                return NotificationType.LIVESTREAM_COMPLETED
+
+            logger.info("Detected regular upload: %s", data.get('title', 'Unknown'))
+            return NotificationType.UPLOAD
+
+        except requests.exceptions.RequestException as exc:
+            logger.error("Network error calling YouTube API: %s", exc)
             return YouTubeNotification._fallback_title_detection(data)
-        except Exception as e:
-            logger.error(f"Unexpected error in YouTube API detection: {e}")
+        except Exception as exc:
+            logger.error("Unexpected error in YouTube API detection: %s", exc)
             return YouTubeNotification._fallback_title_detection(data)
     
     @staticmethod
