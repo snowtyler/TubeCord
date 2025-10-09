@@ -539,6 +539,7 @@ class CommunityPostScraper:
                 # Run yp-dl command without --folder-path to avoid the path separator bug
                 cmd = [
                     'yp-dl',
+                    '--reverse',
                     '--verbose',
                     channel_url
                 ]
@@ -581,6 +582,7 @@ class CommunityPostScraper:
                     try:
                         posts_data = self._load_json_file(json_file)
                         if posts_data:
+                            # With --reverse, yp-dl returns newest-first; slice takes newest items
                             for post_data in posts_data[:limit]:  # Limit the number of posts
                                 try:
                                     post = self._parse_yp_dl_post_data(post_data, channel_id)
