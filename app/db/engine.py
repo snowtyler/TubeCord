@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine, make_url
 
 from app.config.settings import settings
+
+
+logger = logging.getLogger(__name__)
 
 
 def _prepare_sqlite_directory(database_url: str) -> dict:
@@ -40,4 +44,28 @@ def get_engine(database_url: Optional[str] = None, *, echo: Optional[bool] = Non
     if connect_args:
         kwargs["connect_args"] = connect_args
 
-    return create_engine(url, **kwargs)
+    engine = create_engine(url, **kwargs)
+
+    masked_url = _mask_connection_url(url)
+
+    def _log_connect(dbapi_connection, connection_record):  # pragma: no cover - side effect only
+        if connection_record.info.get("_tubecord_logged"):
+            return
+        logger.info("Database connection established to %s", masked_url)
+        connection_record.info["_tubecord_logged"] = True
+
+    event.listen(engine, "connect", _log_connect, once=False)
+
+    return engine
+
+
+def _mask_connection_url(raw_url: str) -> str:
+    """Hide credentials in a SQLAlchemy URL when logging."""
+    try:
+        url = make_url(raw_url)
+    except Exception:  # pragma: no cover - defensive
+        return raw_url
+
+    if url.password:
+        url = url.set(password="***")
+    return str(url)
