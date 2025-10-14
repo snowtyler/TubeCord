@@ -5,6 +5,7 @@ import sys
 import os
 from pathlib import Path
 import requests
+import pytest
 from dotenv import load_dotenv
 
 # Ensure project root is importable
@@ -32,7 +33,7 @@ def test_api_key():
     if not api_key or api_key == 'your_youtube_api_key_here':
         print("❌ ERROR: YOUTUBE_API_KEY not set in .env file")
         print("Please follow the setup guide in YOUTUBE_API_SETUP.md")
-        return False
+        pytest.skip("YOUTUBE_API_KEY not configured")
 
     print(f"🔑 Testing API key: {_mask_api_key(api_key)}")
 
@@ -55,9 +56,8 @@ def test_api_key():
                 title = video['snippet']['title']
                 print("✅ API key is valid!")
                 print(f"📹 Test video: {title}")
-                return True
-            print("❌ API key valid but no video data returned")
-            return False
+                return
+            pytest.fail("API key valid but no video data returned")
         if response.status_code == 403:
             error_data = response.json()
             error_reason = error_data.get('error', {}).get('errors', [{}])[0].get('reason', 'unknown')
@@ -71,18 +71,18 @@ def test_api_key():
             else:
                 print(f"❌ ERROR: API access denied - {error_reason}")
                 print("Check API key restrictions in Google Cloud Console")
-            return False
+            pytest.fail(f"YouTube API access denied: {error_reason}")
 
         print(f"❌ ERROR: API request failed with status {response.status_code}")
         print(f"Response: {response.text}")
-        return False
+        pytest.fail(f"YouTube API request failed with status {response.status_code}")
 
     except requests.exceptions.RequestException as exc:
         print(f"❌ ERROR: Network error - {exc}")
-        return False
+        pytest.skip(f"Network error while calling YouTube API: {exc}")
     except Exception as exc:
         print(f"❌ ERROR: Unexpected error - {exc}")
-        return False
+        pytest.fail(f"Unexpected error during YouTube API test: {exc}")
 
 
 def test_livestream_detection():
@@ -171,7 +171,19 @@ def main():
     print("=" * 50)
 
     print("\n1️⃣ TESTING API KEY...")
-    api_valid = test_api_key()
+    api_valid = True
+
+    try:
+        test_api_key()
+    except pytest.skip.Exception as exc:
+        print(f"⚠️  Skipping API key tests: {exc}")
+        api_valid = False
+    except AssertionError as exc:
+        print(f"❌ API key test failed: {exc}")
+        api_valid = False
+    except Exception as exc:
+        print(f"❌ API key test raised an unexpected exception: {exc}")
+        api_valid = False
 
     if api_valid:
         test_livestream_detection()

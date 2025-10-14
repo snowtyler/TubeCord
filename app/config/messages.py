@@ -3,7 +3,6 @@ Discord message templates and formatting configuration.
 """
 
 from typing import Dict, Any, List
-from datetime import datetime, timezone
 
 
 class MessageTemplates:
@@ -14,15 +13,6 @@ class MessageTemplates:
     LIVESTREAM_MESSAGE = "📡 Livestream scheduled!"
     LIVESTREAM_LIVE_MESSAGE = "🔴 LIVE now!"
     COMMUNITY_POST_MESSAGE = "📝 New community post!"
-    
-    # Custom embed colors
-    COLORS = {
-        'upload': 0xFF0000,      # YouTube red
-        'livestream': 0xFF4500,  # Orange red for scheduled
-        'livestream_live': 0xFF0000,  # Bright red for LIVE
-        'community': 0x1DA1F2,   # Twitter blue for community posts
-        'default': 0xFF0000
-    }
     
     # Message format templates with placeholders
     TEMPLATES = {
@@ -133,33 +123,6 @@ class MessageTemplates:
         
         return template.format(**format_data)
     
-    @staticmethod
-    def get_embed_color(template_type: str) -> int:
-        """Get the embed color for a specific template type."""
-        return MessageTemplates.COLORS.get(template_type, MessageTemplates.COLORS['default'])
-    
-    @staticmethod
-    def format_timestamp(timestamp_str: str = None) -> str:
-        """
-        Format a timestamp for Discord embed.
-        
-        Args:
-            timestamp_str: ISO timestamp string, uses current time if None
-            
-        Returns:
-            Formatted timestamp string
-        """
-        if timestamp_str:
-            try:
-                # Parse the timestamp and return ISO format
-                dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-                return dt.isoformat()
-            except (ValueError, AttributeError):
-                pass
-        
-        # Fall back to current time
-        return datetime.now(timezone.utc).isoformat() + 'Z'
-
 
 def get_notification_config():
     """Get notification configuration with environment variable override."""

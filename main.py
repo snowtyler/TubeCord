@@ -9,7 +9,6 @@ import requests
 import threading
 import time
 from flask import Flask
-from typing import Optional
 
 # Add the app directory to Python path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'app'))
@@ -17,7 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'app'))
 from app.version import VERSION, VERSION_INFO
 from app.config.settings import settings
 from app.utils.logging import setup_logging, get_logger, log_websub_event, log_discord_event, log_notification_processing
-from app.webhooks.websub import websub_bp, WebSubHandler
+from app.webhooks.websub import WebSubHandler
 from app.discord.client import DiscordClient
 from app.models.notification import YouTubeNotification, NotificationType
 from app.models.discord_config import DiscordConfiguration

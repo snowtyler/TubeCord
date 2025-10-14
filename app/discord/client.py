@@ -32,6 +32,7 @@ class DiscordClient:
     def __init__(self):
         self.rate_limit_delay = 0.2  # 5 requests per second max
         self.last_request_time = 0
+        self.max_rate_limit_retries = 3
     
     def _enforce_rate_limit(self):
         """Enforce Discord webhook rate limiting."""
@@ -89,50 +90,69 @@ class DiscordClient:
         Returns:
             True if message was sent successfully, False otherwise
         """
-        self._enforce_rate_limit()
-        
         payload = {}
-        
+
         # Build message content with role mentions
         message_parts = []
         if role_mentions:
             mentions = [f'<@&{role_id}>' for role_id in role_mentions]
             message_parts.extend(mentions)
-        
+
         if content:
             message_parts.append(content)
-        
+
         if message_parts:
             payload['content'] = ' '.join(message_parts)
-        
+
         # Add embed if provided
         if embed:
             payload['embeds'] = [self._build_embed_dict(embed)]
-        
-        try:
-            response = requests.post(
-                webhook_url,
-                json=payload,
-                headers={'Content-Type': 'application/json'},
-                timeout=10
-            )
-            
+
+        attempts = 0
+
+        while attempts <= self.max_rate_limit_retries:
+            self._enforce_rate_limit()
+
+            try:
+                response = requests.post(
+                    webhook_url,
+                    json=payload,
+                    headers={'Content-Type': 'application/json'},
+                    timeout=10
+                )
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Failed to send Discord webhook: {e}")
+                return False
+
             if response.status_code == 204:
                 logger.info("Discord message sent successfully")
                 return True
-            elif response.status_code == 429:
-                # Rate limited
-                retry_after = response.json().get('retry_after', 1)
-                logger.warning(f"Discord rate limited, retrying after {retry_after}s")
-                time.sleep(retry_after)
-                return self.send_webhook_message(webhook_url, content, embed, role_mentions)
-            else:
-                logger.error(f"Discord webhook failed: {response.status_code} - {response.text}")
-                return False
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to send Discord webhook: {e}")
+
+            if response.status_code == 429:
+                retry_after = 1
+                try:
+                    retry_after = response.json().get('retry_after', retry_after)
+                except ValueError:
+                    header_retry = response.headers.get('Retry-After')
+                    if header_retry:
+                        try:
+                            retry_after = float(header_retry)
+                        except ValueError:
+                            pass
+
+                attempts += 1
+                if attempts > self.max_rate_limit_retries:
+                    logger.error("Discord rate limit persisted after retries; giving up")
+                    return False
+
+                logger.warning(f"Discord rate limited, retrying after {retry_after}s (attempt {attempts}/{self.max_rate_limit_retries})")
+                time.sleep(max(retry_after, 0))
+                continue
+
+            logger.error(f"Discord webhook failed: {response.status_code} - {response.text}")
             return False
+
+        return False
     
     def send_youtube_notification(
         self,
@@ -165,7 +185,6 @@ class DiscordClient:
         
         if use_rich_embed:
             # Build rich embed
-            from app.config.messages import MessageTemplates
             color_map = {
                 'upload': 0xFF0000,      # YouTube red
                 'livestream': 0xFF4500,  # Orange red for scheduled

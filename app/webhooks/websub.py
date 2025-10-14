@@ -7,13 +7,9 @@ import logging
 import xml.etree.ElementTree as ET
 import hmac
 import hashlib
-from flask import Blueprint, request, abort
 from typing import Dict, Any, Optional
-from urllib.parse import parse_qs
 
 logger = logging.getLogger(__name__)
-
-websub_bp = Blueprint('websub', __name__)
 
 
 class WebSubHandler:

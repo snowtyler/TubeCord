@@ -5,7 +5,9 @@ Tests the community scraper, database storage, and notification system.
 
 import sys
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, UTC
+
+import pytest
 
 # Ensure project root is on the Python path
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -31,7 +33,7 @@ def test_community_scraper():
     channel_id = settings.YOUTUBE_CHANNEL_ID
     if not channel_id:
         logger.error("No YOUTUBE_CHANNEL_ID set in environment")
-        return False
+        pytest.skip("YOUTUBE_CHANNEL_ID not configured")
 
     logger.info(f"Scraping community posts for channel: {channel_id}")
 
@@ -47,11 +49,9 @@ def test_community_scraper():
         else:
             logger.info("No new community posts found")
 
-        return True
-
     except Exception as exc:
         logger.error(f"Error testing community scraper: {exc}")
-        return False
+        pytest.fail(f"Community scraper raised unexpected error: {exc}")
 
 
 def test_database_operations():
@@ -68,7 +68,7 @@ def test_database_operations():
         image_urls=['https://example.com/test.jpg'],
         video_attachments=[],
         poll_data=None,
-        published_time=datetime.utcnow().isoformat() + 'Z',
+        published_time=datetime.now(UTC).isoformat().replace('+00:00', 'Z'),
         like_count=10,
         url='https://www.youtube.com/post/test_db_123'
     )
@@ -85,11 +85,9 @@ def test_database_operations():
             marked = scraper.mark_post_notified(post_id)
             logger.info(f"Marked post {post_id} as notified: {marked}")
 
-        return True
-
     except Exception as exc:
         logger.error(f"Error testing database operations: {exc}")
-        return False
+        pytest.fail(f"Database operation failed: {exc}")
 
 
 def test_notification_handler():
@@ -112,7 +110,7 @@ def test_notification_handler():
                 'thumbnail': 'https://img.youtube.com/vi/dQw4w9WgXcQ/default.jpg'
             }],
             poll_data={'question': 'Example poll question?', 'options': ['Option 1', 'Option 2']},
-            published_time=datetime.utcnow().isoformat() + 'Z',
+            published_time=datetime.now(UTC).isoformat().replace('+00:00', 'Z'),
             like_count=123,
             url='https://www.youtube.com/post/test_notification_456'
         )
@@ -120,11 +118,9 @@ def test_notification_handler():
         handler.handle_new_posts([test_post])
         logger.info("Test notification sent successfully")
 
-        return True
-
     except Exception as exc:
         logger.error(f"Error testing notification handler: {exc}")
-        return False
+        pytest.fail(f"Notification handler failed: {exc}")
 
 
 def test_scheduler():
@@ -161,11 +157,9 @@ def test_scheduler():
         status = scheduler.get_status()
         logger.info(f"Scheduler status: {status}")
 
-        return True
-
     except Exception as exc:
         logger.error(f"Error testing scheduler: {exc}")
-        return False
+        pytest.fail(f"Scheduler test failed: {exc}")
 
 
 def main():
@@ -180,30 +174,41 @@ def main():
     ]
 
     results = {}
+    skipped = set()
 
     for test_name, test_func in tests:
         logger.info(f"\n{'=' * 20} {test_name} {'=' * 20}")
         try:
-            results[test_name] = test_func()
+            test_func()
+            results[test_name] = True
+        except pytest.skip.Exception as exc:
+            logger.warning(f"Test {test_name} skipped: {exc}")
+            results[test_name] = None
+            skipped.add(test_name)
         except Exception as exc:
             logger.error(f"Test {test_name} failed with exception: {exc}")
             results[test_name] = False
 
     logger.info(f"\n{'=' * 20} Test Results {'=' * 20}")
-    passed = sum(1 for result in results.values() if result)
+    passed = sum(1 for result in results.values() if result is True)
 
     for test_name, result in results.items():
-        status = "PASS" if result else "FAIL"
+        if result is True:
+            status = "PASS"
+        elif result is False:
+            status = "FAIL"
+        else:
+            status = "SKIP"
         logger.info(f"{test_name}: {status}")
 
-    logger.info(f"\nTests passed: {passed}/{len(tests)}")
+    logger.info(f"\nTests passed: {passed}/{len(tests) - len(skipped)} (skipped {len(skipped)})")
 
-    if passed == len(tests):
+    if passed == len(tests) - len(skipped):
         logger.info("🎉 All tests passed! Community post functionality is working.")
     else:
         logger.warning("⚠️ Some tests failed. Check the logs above for details.")
 
-    return passed == len(tests)
+    return passed == len(tests) - len(skipped)
 
 
 if __name__ == '__main__':
