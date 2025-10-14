@@ -3,6 +3,10 @@
 ## Project Overview
 TubeCord is a Python-based YouTube channel monitoring service that consumes WebSub (PubSubHubbub) notifications for uploads and livestreams, formats the payloads, and delivers Discord webhook messages with configurable role mentions. It also polls for YouTube Community posts and forwards them to Discord when configured. The production entry point runs a Flask app behind the Waitress WSGI server.
 
+Always use context7 when I need code generation, setup or configuration steps, or
+library/API documentation. This means you should automatically use the Context7 MCP
+tools to resolve library id and get library docs without me having to explicitly ask.
+
 ## Architecture Guidelines
 
 ### Core Components
