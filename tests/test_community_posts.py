@@ -38,7 +38,8 @@ def test_community_scraper():
     logger.info(f"Scraping community posts for channel: {channel_id}")
 
     try:
-        posts = scraper.scrape_channel_posts(channel_id, limit=5)
+        # Scraper is configured to always fetch the latest 10 posts internally
+        posts = scraper.scrape_channel_posts(channel_id)
 
         if posts:
             logger.info(f"Found {len(posts)} new community posts:")

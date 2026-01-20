@@ -540,16 +540,23 @@ class CommunityPostScraper:
                 original_cwd = os.getcwd()
                 os.chdir(temp_dir)
                 
+                # Always scrape a fixed window of the latest 10 posts.
+                # This keeps runtime predictable and avoids re-processing large histories.
+                effective_limit = 10
+
                 # yp-dl seems to have a bug where it tries to create files in a 'channel/' subdirectory
                 # Let's create this directory structure it expects
                 os.makedirs('channel', exist_ok=True)
-                
+
                 # Run yp-dl command without --folder-path to avoid the path separator bug
+                # Use the new --limit option to stop scraping after collecting N posts (from newest)
                 cmd = [
                     'yp-dl',
                     '--reverse',
                     '--verbose',
-                    channel_url
+                    '--limit',
+                    str(effective_limit),
+                    channel_url,
                 ]
                 
                 logger.debug(f"Running yp-dl command: {' '.join(cmd)}")
@@ -590,8 +597,9 @@ class CommunityPostScraper:
                     try:
                         posts_data = self._load_json_file(json_file)
                         if posts_data:
-                            # With --reverse, yp-dl returns newest-first; slice takes newest items
-                            for post_data in posts_data[:limit]:  # Limit the number of posts
+                            # With --reverse, yp-dl returns newest-first; slice takes newest items.
+                            # We rely on the same fixed window of 10 posts here as well.
+                            for post_data in posts_data[:effective_limit]:
                                 try:
                                     post = self._parse_yp_dl_post_data(post_data, channel_id)
                                     

@@ -152,8 +152,8 @@ class CommunityPostScheduler:
             logger.warning("No YouTube channel ID configured for community post checking")
             return []
         
-        # Scrape new posts
-        new_posts = scraper.scrape_channel_posts(channel_id, limit=20)
+        # Scrape new posts (scraper is configured to always fetch the latest 10 posts)
+        new_posts = scraper.scrape_channel_posts(channel_id)
         
         if new_posts:
             logger.info(f"Found {len(new_posts)} new community posts")
