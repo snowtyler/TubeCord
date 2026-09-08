@@ -9,7 +9,7 @@ import random
 import requests
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from flask import Flask
 
 # Add the app directory to Python path
@@ -98,7 +98,6 @@ class WebSubSubscriptionManager:
             )
             
             if response.status_code in [202, 204]:
-                from datetime import datetime, timezone
                 self.last_subscription_time = datetime.now(timezone.utc)
                 logger.info(f"WebSub subscription request accepted at {self.last_subscription_time.isoformat()}")
                 log_websub_event(logger, 'subscription_requested', {
@@ -397,7 +396,6 @@ def webhook():
         
         notification_data = handler.parse_notification(xml_content)
         if notification_data:
-            from datetime import datetime, timezone
             subscription_manager.last_notification_time = datetime.now(timezone.utc)
             logger.info(f"Received WebSub notification at {subscription_manager.last_notification_time.isoformat()}")
             
@@ -597,7 +595,6 @@ def test_notification():
 @app.route('/test-livestream', methods=['POST'])
 def test_livestream():
     """Test endpoint to simulate a YouTube livestream notification."""
-    from datetime import datetime, timezone, timedelta
     
     # Calculate a scheduled time 30 minutes from now for testing
     scheduled_time = datetime.now(timezone.utc) + timedelta(minutes=30)
@@ -699,7 +696,6 @@ def test_community_post():
     
     # Create a test community post
     from app.utils.community_scraper import CommunityPost
-    from datetime import datetime, timezone
     
     test_post = CommunityPost(
         post_id='test_community_123',

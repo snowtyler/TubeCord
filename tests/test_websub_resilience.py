@@ -86,3 +86,31 @@ def test_stop_short_circuits_retry(monkeypatch):
     monkeypatch.setattr(mgr, "subscribe_to_channel", lambda: False)
     mgr.stop()  # signal shutdown before we start
     assert mgr.subscribe_with_retry() is False
+
+
+def test_subscribe_records_attempt_time_even_on_failure(monkeypatch):
+    """Regression: `datetime` must resolve at module scope (no local shadowing)."""
+    import requests as _requests
+
+    mgr = _mgr()
+
+    def boom(*a, **k):
+        raise _requests.exceptions.RequestException("blocked")
+
+    monkeypatch.setattr(main.requests, "post", boom)
+    assert mgr.subscribe_to_channel() is False           # no UnboundLocalError
+    assert mgr.last_subscribe_attempt_time is not None    # reached datetime.now()
+
+
+def test_get_challenge_confirms_subscription():
+    """A hub GET challenge is echoed and marks the subscription confirmed."""
+    client = main.app.test_client()
+    resp = client.get('/webhook', query_string={
+        'hub.mode': 'subscribe',
+        'hub.topic': settings.youtube_topic_url,
+        'hub.challenge': 'CHAL42',
+        'hub.lease_seconds': '432000',
+    })
+    assert resp.status_code == 200
+    assert resp.get_data(as_text=True) == 'CHAL42'
+    assert main.subscription_manager.subscription_confirmed is True
