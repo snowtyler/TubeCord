@@ -34,6 +34,9 @@ app = Flask(__name__)
 # Initialize components
 discord_client = DiscordClient()
 discord_config = DiscordConfiguration.from_settings(settings)
+# Separate destinations for /test-* injections so they never post to the
+# public production channels.
+test_discord_config = DiscordConfiguration.from_settings(settings, test=True)
 
 # Initialize community post monitoring
 community_scheduler = None
@@ -223,37 +226,64 @@ class WebSubSubscriptionManager:
 subscription_manager = WebSubSubscriptionManager()
 
 
-def process_youtube_notification(notification_data: dict) -> bool:
+def process_youtube_notification(notification_data: dict, *, config_source=None,
+                                 test_mode: bool = False, force_type=None) -> bool:
     """
     Process a YouTube notification and send to Discord.
-    
+
     Args:
         notification_data: Parsed notification data from WebSub
-        
+        config_source: DiscordConfiguration to deliver through (defaults to the
+            production ``discord_config``). ``/test-*`` passes ``test_discord_config``.
+        test_mode: When True, bypass the recency/completed-livestream gates so a
+            synthetic injection always delivers, and treat a missing destination
+            as an error instead of a silent no-op.
+        force_type: Optional ``NotificationType`` to classify as, skipping the
+            YouTube API lookup (used by test injectors so a livestream test
+            renders as a livestream rather than being misread as an upload).
+
     Returns:
         True if notification was processed successfully, False otherwise
     """
     try:
-        # Create notification model
-        notification = YouTubeNotification.from_websub_data(notification_data)
-        
-        logger.info(f"Processing notification: {notification.title} by {notification.author}")
-        
-        # Skip completed livestreams (they've already been notified when they went live)
-        if notification.notification_type == NotificationType.LIVESTREAM_COMPLETED:
-            logger.info(f"Skipping completed livestream notification: {notification.title}")
-            return True
-        
-        # Check if notification is recent (avoid spam from old videos)
-        if not notification.is_recent(hours=24):
-            logger.info(f"Skipping old notification: {notification.title}")
-            return True
-        
+        config_source = config_source if config_source is not None else discord_config
+
+        # Create notification model. A forced type skips the API classification.
+        if force_type is not None:
+            notification = YouTubeNotification(
+                video_id=notification_data['video_id'],
+                channel_id=notification_data['channel_id'],
+                title=notification_data['title'],
+                author=notification_data['author'],
+                url=notification_data['url'],
+                published=notification_data.get('published'),
+                updated=notification_data.get('updated'),
+                notification_type=force_type,
+                scheduled_start_time=notification_data.get('scheduled_start_time'),
+                actual_start_time=notification_data.get('actual_start_time'),
+            )
+        else:
+            notification = YouTubeNotification.from_websub_data(notification_data)
+
+        logger.info(f"Processing notification: {notification.title} by {notification.author}"
+                    f"{' [TEST]' if test_mode else ''}")
+
+        if not test_mode:
+            # Skip completed livestreams (they've already been notified when they went live)
+            if notification.notification_type == NotificationType.LIVESTREAM_COMPLETED:
+                logger.info(f"Skipping completed livestream notification: {notification.title}")
+                return True
+
+            # Check if notification is recent (avoid spam from old videos)
+            if not notification.is_recent(hours=24):
+                logger.info(f"Skipping old notification: {notification.title}")
+                return True
+
         # Get notification configuration
         notification_type = notification.notification_type.value
         logger.info(f"Notification type detected: {notification_type}")
         config = NOTIFICATION_CONFIG.get(notification_type, NOTIFICATION_CONFIG['upload'])
-        
+
         if not config['enabled']:
             logger.info(f"Notifications disabled for type: {notification_type}")
             return True
@@ -265,19 +295,25 @@ def process_youtube_notification(notification_data: dict) -> bool:
         )
         
         # Send to Discord servers configured for this content type
-        content_type_servers = discord_config.get_servers_for_type(notification_type)
+        content_type_servers = config_source.get_servers_for_type(notification_type)
         success_count = 0
         total_servers = len(content_type_servers)
-        
+
         logger.info(f"Found {total_servers} servers for notification type '{notification_type}'")
         if total_servers > 0:
             server_names = [s.server_name or s.content_type for s in content_type_servers]
             logger.info(f"Servers: {', '.join(server_names)}")
-        
+
         if total_servers == 0:
+            if test_mode:
+                logger.error(
+                    f"No TEST webhook configured for '{notification_type}'. Set "
+                    f"TEST_{notification_type.split('_')[0].upper()}_WEBHOOK_URLS to a "
+                    f"test-channel webhook so tests don't post to production.")
+                return False
             logger.info(f"No Discord servers configured for content type: {notification_type}")
             return True  # Not an error if no servers configured for this type
-        
+
         for server in content_type_servers:
             try:
                 # Only use custom message for rich embeds
@@ -576,17 +612,28 @@ def test_notification():
     
     from app.webhooks.websub import WebSubHandler
     handler = WebSubHandler()
-    
+
     logger.debug(f"Test XML being parsed: {test_xml}")
     notification_data = handler.parse_notification(test_xml)
     logger.debug(f"Parsed notification data: {notification_data}")
-    
+
     if notification_data:
-        success = process_youtube_notification(notification_data)
+        # Stamp "now" so the rendered timestamp is sensible (delivery itself
+        # bypasses the recency gate in test_mode).
+        now = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+        notification_data['published'] = now
+        notification_data['updated'] = now
+        success = process_youtube_notification(
+            notification_data,
+            config_source=test_discord_config,
+            test_mode=True,
+            force_type=NotificationType.UPLOAD,
+        )
         return {
             'status': 'success' if success else 'failed',
             'notification_data': notification_data,
-            'message': 'Test upload notification processed'
+            'message': 'Test upload notification sent to test channel' if success
+                       else 'Failed — is TEST_UPLOAD_WEBHOOK_URLS configured?'
         }, 200 if success else 500
     else:
         return {'status': 'failed', 'message': 'Failed to parse test notification'}, 400
@@ -625,16 +672,25 @@ def test_livestream():
     # (In real usage, this comes from the YouTube API)
     if notification_data:
         notification_data['scheduled_start_time'] = scheduled_time_str
+        now = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+        notification_data['published'] = now
+        notification_data['updated'] = now
         logger.info(f"Added test scheduled start time: {scheduled_time_str}")
-    
+
     logger.debug(f"Parsed notification data: {notification_data}")
-    
+
     if notification_data:
-        success = process_youtube_notification(notification_data)
+        success = process_youtube_notification(
+            notification_data,
+            config_source=test_discord_config,
+            test_mode=True,
+            force_type=NotificationType.LIVESTREAM,
+        )
         return {
             'status': 'success' if success else 'failed',
             'notification_data': notification_data,
-            'message': 'Test notification processed'
+            'message': 'Test livestream notification sent to test channel' if success
+                       else 'Failed — is TEST_LIVESTREAM_WEBHOOK_URLS configured?'
         }, 200 if success else 500
     else:
         return {'status': 'failed', 'message': 'Failed to parse test notification'}, 400
@@ -693,7 +749,12 @@ def test_community_post():
     """Test endpoint to simulate a community post notification."""
     if not community_handler:
         return {'status': 'error', 'message': 'Community post handler not initialized'}, 400
-    
+
+    if not settings.TEST_COMMUNITY_WEBHOOK_URLS:
+        return {'status': 'error',
+                'message': 'No test channel configured. Set TEST_COMMUNITY_WEBHOOK_URLS '
+                           'so tests do not post to your production community channel.'}, 400
+
     # Create a test community post
     from app.utils.community_scraper import CommunityPost
     
@@ -715,15 +776,20 @@ def test_community_post():
     )
     
     try:
-        # Process the test post
-        community_handler.handle_new_posts([test_post])
-        
+        # Route to the test channel and don't mark the fake post notified.
+        community_handler.handle_new_posts(
+            [test_post],
+            webhook_urls=settings.TEST_COMMUNITY_WEBHOOK_URLS,
+            role_ids=settings.TEST_COMMUNITY_ROLE_IDS,
+            mark_notified=False,
+        )
+
         return {
             'status': 'success',
-            'message': 'Test community post notification sent',
+            'message': 'Test community post notification sent to test channel',
             'test_post': test_post.to_dict()
         }, 200
-        
+
     except Exception as e:
         logger.error(f"Error sending test community post: {e}")
         return {'status': 'error', 'message': str(e)}, 500

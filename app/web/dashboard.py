@@ -95,9 +95,9 @@ _PAGE = r"""<!doctype html>
       <button class="primary" onclick="act('GET','/subscribe','Re-subscribe (with retry)?')">Subscribe</button>
       <button class="danger" onclick="act('GET','/unsubscribe','Unsubscribe from the hub? Delivery will stop until you subscribe again.')">Unsubscribe</button>
       <button onclick="act('POST','/community/check','Force a community-post check now?')">Force community check</button>
-      <button onclick="act('POST','/test-notification','Send a TEST upload to Discord? This posts a real message.')">Test upload → Discord</button>
-      <button onclick="act('POST','/test-livestream','Send a TEST livestream to Discord? This posts a real message.')">Test livestream → Discord</button>
-      <button onclick="act('POST','/test-community','Send a TEST community post to Discord? This posts a real message.')">Test community → Discord</button>
+      <button onclick="act('POST','/test-notification','Send a TEST upload to the test channel?')">Test upload → test ch.</button>
+      <button onclick="act('POST','/test-livestream','Send a TEST livestream to the test channel?')">Test livestream → test ch.</button>
+      <button onclick="act('POST','/test-community','Send a TEST community post to the test channel?')">Test community → test ch.</button>
       <button onclick="loadRaw('/websub/status')">Raw /websub/status</button>
       <button onclick="loadRaw('/health')">Raw /health</button>
     </div>

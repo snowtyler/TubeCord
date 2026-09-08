@@ -37,6 +37,15 @@ class Settings:
     COMMUNITY_WEBHOOK_URLS: List[str] = []
     COMMUNITY_ROLE_IDS: List[str] = []
 
+    # Test destinations - where /test-* injections go (keep these off your
+    # public channels). Fall back to nothing (not prod) when unset.
+    TEST_UPLOAD_WEBHOOK_URLS: List[str] = []
+    TEST_LIVESTREAM_WEBHOOK_URLS: List[str] = []
+    TEST_COMMUNITY_WEBHOOK_URLS: List[str] = []
+    TEST_UPLOAD_ROLE_IDS: List[str] = []
+    TEST_LIVESTREAM_ROLE_IDS: List[str] = []
+    TEST_COMMUNITY_ROLE_IDS: List[str] = []
+
     # Database configuration
     DATABASE_URL: str = os.getenv('DATABASE_URL', 'sqlite:///data/community_posts.db')
     DATABASE_ECHO: bool = os.getenv('DATABASE_ECHO', 'False').lower() == 'true'
@@ -202,7 +211,19 @@ class Settings:
         community_roles = os.getenv('COMMUNITY_ROLE_IDS', '')
         if community_roles:
             self.COMMUNITY_ROLE_IDS = [role_id.strip() for role_id in community_roles.split(',') if role_id.strip()]
-    
+
+        # Test destinations (optional): route /test-* injections to separate
+        # channels so they never post to the public production webhooks.
+        def _csv(name: str) -> List[str]:
+            return [v.strip() for v in os.getenv(name, '').split(',') if v.strip()]
+
+        self.TEST_UPLOAD_WEBHOOK_URLS = _csv('TEST_UPLOAD_WEBHOOK_URLS')
+        self.TEST_LIVESTREAM_WEBHOOK_URLS = _csv('TEST_LIVESTREAM_WEBHOOK_URLS')
+        self.TEST_COMMUNITY_WEBHOOK_URLS = _csv('TEST_COMMUNITY_WEBHOOK_URLS')
+        self.TEST_UPLOAD_ROLE_IDS = _csv('TEST_UPLOAD_ROLE_IDS')
+        self.TEST_LIVESTREAM_ROLE_IDS = _csv('TEST_LIVESTREAM_ROLE_IDS')
+        self.TEST_COMMUNITY_ROLE_IDS = _csv('TEST_COMMUNITY_ROLE_IDS')
+
     def _validate_required_settings(self):
         """Validate that required settings are present."""
         required_settings = [

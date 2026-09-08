@@ -105,33 +105,37 @@ class DiscordConfiguration:
         self.servers = [s for s in self.servers if s.webhook_url != webhook_url]
     
     @classmethod
-    def from_settings(cls, settings) -> 'DiscordConfiguration':
+    def from_settings(cls, settings, test: bool = False) -> 'DiscordConfiguration':
         """
         Create configuration from settings object with per-content-type configurations.
-        
+
         Args:
             settings: Settings instance with per-content-type webhook URLs and roles
-            
+            test: When True, build from the TEST_* destinations instead of the
+                  production webhooks, so /test-* injections stay off public channels.
+
         Returns:
             DiscordConfiguration instance
         """
         config = cls()
-        
+        prefix = 'TEST_' if test else ''
+        label = 'Test_' if test else ''
+
+        def _get(name: str):
+            return getattr(settings, f"{prefix}{name}", [])
+
         # Add upload servers
-        for i, webhook_url in enumerate(settings.UPLOAD_WEBHOOK_URLS):
-            server_name = f"Upload_Server_{i+1}"
-            config.add_server(webhook_url, settings.UPLOAD_ROLE_IDS, 'upload', server_name)
-        
+        for i, webhook_url in enumerate(_get('UPLOAD_WEBHOOK_URLS')):
+            config.add_server(webhook_url, _get('UPLOAD_ROLE_IDS'), 'upload', f"{label}Upload_Server_{i+1}")
+
         # Add livestream servers (handles both scheduled and live notifications)
-        for i, webhook_url in enumerate(settings.LIVESTREAM_WEBHOOK_URLS):
-            server_name = f"Livestream_Server_{i+1}"
-            config.add_server(webhook_url, settings.LIVESTREAM_ROLE_IDS, 'livestream', server_name)
-        
+        for i, webhook_url in enumerate(_get('LIVESTREAM_WEBHOOK_URLS')):
+            config.add_server(webhook_url, _get('LIVESTREAM_ROLE_IDS'), 'livestream', f"{label}Livestream_Server_{i+1}")
+
         # Add community servers
-        for i, webhook_url in enumerate(settings.COMMUNITY_WEBHOOK_URLS):
-            server_name = f"Community_Server_{i+1}"
-            config.add_server(webhook_url, settings.COMMUNITY_ROLE_IDS, 'community', server_name)
-        
+        for i, webhook_url in enumerate(_get('COMMUNITY_WEBHOOK_URLS')):
+            config.add_server(webhook_url, _get('COMMUNITY_ROLE_IDS'), 'community', f"{label}Community_Server_{i+1}")
+
         return config
     
     def to_dict(self) -> Dict[str, Any]:

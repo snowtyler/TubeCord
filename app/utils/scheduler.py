@@ -244,28 +244,36 @@ class CommunityPostNotificationHandler:
         
         logger.info("Community post notification handler initialized")
     
-    def handle_new_posts(self, posts: List):
+    def handle_new_posts(self, posts: List, webhook_urls=None, role_ids=None, mark_notified: bool = True):
         """
         Handle a list of new community posts by sending Discord notifications.
         Only sends notification for the latest post.
-        
+
         Args:
             posts: List of CommunityPost objects
+            webhook_urls: Override destinations (e.g. a test channel). Defaults to
+                the configured production community webhooks.
+            role_ids: Role mentions to use with an override (defaults to none).
+            mark_notified: Persist the "notified" flag. Set False for test
+                injections so they don't pollute the dedup database.
         """
         if not self.discord_client or not self.community_scraper:
             logger.error("Notification handler not properly initialized")
             return
-        
+
         if not posts:
             return
-        
+
         from app.config.settings import settings
         from datetime import datetime
-        
+
         # Get Discord configuration for community posts
-        webhook_urls = settings.get_webhooks_for_type('community')
-        role_ids = settings.get_roles_for_type('community')
-        
+        if webhook_urls is None:
+            webhook_urls = settings.get_webhooks_for_type('community')
+            role_ids = settings.get_roles_for_type('community')
+        else:
+            role_ids = role_ids or []
+
         if not webhook_urls:
             logger.warning("No Discord webhook URLs configured for community posts")
             return
@@ -287,7 +295,8 @@ class CommunityPostNotificationHandler:
         
         # Mark all other posts as notified without sending notifications
         for post in sorted_posts[1:]:
-            self.community_scraper.mark_post_notified(post.post_id)
+            if mark_notified:
+                self.community_scraper.mark_post_notified(post.post_id)
             logger.debug(f"Marked older post as notified without notification: {post.post_id} (published: {post.published_time})")
         
         successful_notifications = 0
@@ -313,7 +322,7 @@ class CommunityPostNotificationHandler:
                     logger.error(f"Failed to send community post notification: {latest_post.post_id}")
             
             # Mark post as notified if at least one notification succeeded
-            if successful_notifications > 0:
+            if successful_notifications > 0 and mark_notified:
                 self.community_scraper.mark_post_notified(latest_post.post_id)
             
         except Exception as e:
