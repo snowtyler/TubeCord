@@ -5,9 +5,11 @@ Handles WebSub subscriptions and YouTube notifications.
 
 import sys
 import os
+import random
 import requests
 import threading
 import time
+from datetime import datetime, timezone
 from flask import Flask
 
 # Add the app directory to Python path
@@ -37,17 +39,35 @@ discord_config = DiscordConfiguration.from_settings(settings)
 community_scheduler = None
 community_handler = None
 
+# Cloudflare Tunnel (optional; provides an HTTPS callback)
+tunnel_manager = None
+
 
 class WebSubSubscriptionManager:
-    """Manages WebSub subscriptions to YouTube channels."""
-    
+    """Manages WebSub subscriptions to YouTube channels.
+
+    Resilience model:
+    * ``subscribe_to_channel`` sends one subscribe request. The hub returning
+      202/204 means *accepted*, not *verified*.
+    * ``subscribe_with_retry`` rides out transient hub failures (e.g. the hub's
+      intermittent HTTP 503) with exponential backoff.
+    * A background watchdog re-subscribes when the subscription is unverified,
+      near lease expiry, or was accepted but never verified within a timeout —
+      so a single flaky-hub moment can't silently kill delivery for days.
+    """
+
     def __init__(self):
+        # ``subscription_active`` = the most recent subscribe POST was accepted.
         self.subscription_active = False
-        self.lease_seconds = 432000  # 5 days
-        self.last_subscription_time = None
-        self.last_verification_time = None
+        # ``subscription_confirmed`` = the hub completed the GET challenge.
+        self.subscription_confirmed = False
+        self.lease_seconds = settings.WEBSUB_LEASE_SECONDS
+        self.last_subscription_time = None        # last accepted subscribe request
+        self.last_subscribe_attempt_time = None   # last subscribe POST (any outcome)
+        self.last_verification_time = None        # last hub challenge verified
         self.last_notification_time = None
-    
+        self._stop = threading.Event()
+
     def subscribe_to_channel(self) -> bool:
         """
         Subscribe to YouTube channel WebSub notifications.
@@ -68,7 +88,8 @@ class WebSubSubscriptionManager:
             
             logger.info(f"Subscribing to WebSub for channel: {settings.YOUTUBE_CHANNEL_ID}")
             logger.debug(f"Subscription data: {subscription_data}")
-            
+
+            self.last_subscribe_attempt_time = datetime.now(timezone.utc)
             response = requests.post(
                 settings.WEBSUB_HUB_URL,
                 data=subscription_data,
@@ -133,21 +154,70 @@ class WebSubSubscriptionManager:
             logger.error(f"Failed to unsubscribe from WebSub: {e}")
             return False
     
-    def schedule_renewal(self):
-        """Schedule subscription renewal before lease expires."""
-        def renewal_task():
-            # Renew subscription 1 hour before it expires
-            renewal_delay = self.lease_seconds - 3600
-            time.sleep(renewal_delay)
-            
-            if self.subscription_active:
-                logger.info("Renewing WebSub subscription")
-                self.subscribe_to_channel()
-                self.schedule_renewal()  # Schedule next renewal
-        
-        if self.subscription_active:
-            thread = threading.Thread(target=renewal_task, daemon=True)
-            thread.start()
+    def subscribe_with_retry(self) -> bool:
+        """Attempt to subscribe, retrying with exponential backoff + jitter.
+
+        Handles transient hub failures (notably the hub's intermittent
+        HTTP 503) that would otherwise let the subscription lapse. Returns
+        True as soon as a subscribe request is accepted (202/204).
+        """
+        attempts = settings.WEBSUB_SUBSCRIBE_MAX_RETRIES
+        base = settings.WEBSUB_SUBSCRIBE_RETRY_BASE_SECONDS
+        cap = settings.WEBSUB_SUBSCRIBE_RETRY_MAX_SECONDS
+
+        for attempt in range(1, attempts + 1):
+            if self._stop.is_set():
+                return False
+            if self.subscribe_to_channel():
+                logger.info(f"Subscribe request accepted (attempt {attempt}/{attempts})")
+                return True
+            if attempt < attempts:
+                delay = min(cap, base * (2 ** (attempt - 1)))
+                delay += random.uniform(0, delay * 0.25)  # jitter to avoid lockstep retries
+                logger.warning(
+                    f"Subscribe attempt {attempt}/{attempts} failed; retrying in {delay:.0f}s"
+                )
+                self._stop.wait(timeout=delay)
+
+        logger.error(f"All {attempts} subscribe attempts failed")
+        return False
+
+    def _needs_renewal(self) -> tuple[bool, str]:
+        """Decide whether the subscription needs (re)subscribing right now."""
+        now = datetime.now(timezone.utc)
+
+        if self.last_verification_time is None:
+            return True, "no verified subscription yet"
+
+        verified_age = (now - self.last_verification_time).total_seconds()
+        if verified_age >= self.lease_seconds - settings.WEBSUB_RENEWAL_LEAD_SECONDS:
+            return True, f"verified lease near/after expiry ({int(verified_age)}s old)"
+
+        # Accepted a subscribe request but the hub never came back to verify it.
+        if (self.last_subscription_time is not None
+                and self.last_subscription_time > self.last_verification_time
+                and (now - self.last_subscription_time).total_seconds()
+                >= settings.WEBSUB_VERIFY_TIMEOUT_SECONDS):
+            return True, "last subscribe accepted but never verified"
+
+        return False, ""
+
+    def run_watchdog(self):
+        """Subscribe immediately, then periodically ensure the sub stays live."""
+        def loop():
+            self.subscribe_with_retry()
+            interval = settings.WEBSUB_WATCHDOG_INTERVAL_SECONDS
+            while not self._stop.wait(timeout=interval):
+                needed, reason = self._needs_renewal()
+                if needed:
+                    logger.info(f"Watchdog renewing WebSub subscription: {reason}")
+                    self.subscribe_with_retry()
+
+        threading.Thread(target=loop, daemon=True, name="websub-watchdog").start()
+
+    def stop(self):
+        """Signal the watchdog / retry loops to exit."""
+        self._stop.set()
 
 
 # Global subscription manager
@@ -288,8 +358,9 @@ def webhook():
             logger.debug(f"Request args: {dict(request.args)}")
             
             challenge = handler.verify_challenge(request.args)
-            from datetime import datetime, timezone
             subscription_manager.last_verification_time = datetime.now(timezone.utc)
+            subscription_manager.subscription_confirmed = True
+            subscription_manager.subscription_active = True
             logger.info(f"WebSub challenge verification successful at {subscription_manager.last_verification_time.isoformat()}")
             return challenge, 200
         except ValueError as e:
@@ -349,6 +420,14 @@ def webhook():
     return '', 405
 
 
+@app.route('/')
+@app.route('/dashboard')
+def dashboard():
+    """Serve the operator WebSub dashboard (HTML)."""
+    from app.web.dashboard import render_dashboard
+    return render_dashboard(VERSION), 200, {'Content-Type': 'text/html; charset=utf-8'}
+
+
 @app.route('/health')
 def health_check():
     """Health check endpoint for monitoring."""
@@ -356,6 +435,7 @@ def health_check():
         'status': 'healthy',
         'version': VERSION,
         'subscription_active': subscription_manager.subscription_active,
+        'subscription_confirmed': subscription_manager.subscription_confirmed,
         'discord_servers': {
             'upload': len(discord_config.get_servers_for_type('upload')),
             'livestream': len(discord_config.get_servers_for_type('livestream')),
@@ -368,12 +448,12 @@ def health_check():
 @app.route('/websub/status')
 def websub_status():
     """Get detailed WebSub subscription status and diagnostics."""
-    from datetime import datetime, timezone, timedelta
-    
     status = {
         'subscription_active': subscription_manager.subscription_active,
+        'subscription_confirmed': subscription_manager.subscription_confirmed,
         'lease_seconds': subscription_manager.lease_seconds,
         'last_subscription_time': subscription_manager.last_subscription_time.isoformat() if subscription_manager.last_subscription_time else None,
+        'last_subscribe_attempt_time': subscription_manager.last_subscribe_attempt_time.isoformat() if subscription_manager.last_subscribe_attempt_time else None,
         'last_verification_time': subscription_manager.last_verification_time.isoformat() if subscription_manager.last_verification_time else None,
         'last_notification_time': subscription_manager.last_notification_time.isoformat() if subscription_manager.last_notification_time else None,
         'callback_url': settings.CALLBACK_URL,
@@ -381,31 +461,38 @@ def websub_status():
         'hub_url': settings.WEBSUB_HUB_URL,
         'channel_id': settings.YOUTUBE_CHANNEL_ID
     }
-    
-    # Calculate time since last events
+
+    # Time since last events. Lease expiry is anchored on the last *verified*
+    # subscription (the only event that proves the hub will deliver), not on
+    # the last accepted subscribe request.
     now = datetime.now(timezone.utc)
     if subscription_manager.last_subscription_time:
-        time_since_subscription = (now - subscription_manager.last_subscription_time).total_seconds()
-        status['seconds_since_subscription'] = int(time_since_subscription)
-        status['subscription_expires_in'] = int(subscription_manager.lease_seconds - time_since_subscription)
-        status['subscription_expired'] = time_since_subscription > subscription_manager.lease_seconds
-    
+        status['seconds_since_subscription'] = int((now - subscription_manager.last_subscription_time).total_seconds())
+
     if subscription_manager.last_verification_time:
-        status['seconds_since_verification'] = int((now - subscription_manager.last_verification_time).total_seconds())
-    
+        verified_age = (now - subscription_manager.last_verification_time).total_seconds()
+        status['seconds_since_verification'] = int(verified_age)
+        status['subscription_expires_in'] = int(subscription_manager.lease_seconds - verified_age)
+        status['subscription_expired'] = verified_age > subscription_manager.lease_seconds
+    else:
+        status['subscription_expired'] = True
+
     if subscription_manager.last_notification_time:
         status['seconds_since_notification'] = int((now - subscription_manager.last_notification_time).total_seconds())
-    
+
     # Add warnings if subscription might be stale
     warnings = []
-    if not subscription_manager.subscription_active:
-        warnings.append('Subscription is not active')
-    elif not subscription_manager.last_verification_time:
-        warnings.append('No verification challenge received yet - subscription may not be confirmed')
-    elif subscription_manager.last_subscription_time:
-        if (now - subscription_manager.last_subscription_time).total_seconds() > subscription_manager.lease_seconds:
-            warnings.append('Subscription has expired and needs renewal')
-    
+    if not subscription_manager.subscription_confirmed:
+        warnings.append('Subscription not confirmed by hub verification yet')
+    if not subscription_manager.last_verification_time:
+        warnings.append('No verification challenge received yet - subscription may not be live')
+    elif (now - subscription_manager.last_verification_time).total_seconds() > subscription_manager.lease_seconds:
+        warnings.append('Verified lease has expired and needs renewal')
+    if (subscription_manager.last_subscription_time and subscription_manager.last_verification_time
+            and subscription_manager.last_subscription_time > subscription_manager.last_verification_time
+            and (now - subscription_manager.last_subscription_time).total_seconds() > settings.WEBSUB_VERIFY_TIMEOUT_SECONDS):
+        warnings.append('Last subscribe was accepted but never verified by the hub')
+
     status['warnings'] = warnings
     
     return status, 200
@@ -413,10 +500,9 @@ def websub_status():
 
 @app.route('/subscribe')
 def manual_subscribe():
-    """Manually trigger WebSub subscription (for testing)."""
-    success = subscription_manager.subscribe_to_channel()
+    """Manually trigger a WebSub subscription (with retry/backoff)."""
+    success = subscription_manager.subscribe_with_retry()
     if success:
-        subscription_manager.schedule_renewal()
         return {'status': 'subscription_requested'}, 200
     else:
         return {'status': 'subscription_failed'}, 500
@@ -647,6 +733,48 @@ def test_community_post():
         return {'status': 'error', 'message': str(e)}, 500
 
 
+def _apply_callback_url(url: str) -> None:
+    """Point the WebSub callback at ``url`` (e.g. a freshly-created tunnel)."""
+    settings.CALLBACK_URL = url
+    logger.info(f"Using callback URL: {url}")
+
+
+def _on_tunnel_url_change(url: str) -> None:
+    """Quick-tunnel URL changed (tunnel restarted): re-point and re-subscribe."""
+    _apply_callback_url(url)
+    subscription_manager.subscribe_with_retry()
+
+
+def _start_tunnel_if_configured() -> None:
+    """Start a Cloudflare Tunnel when TUNNEL_MODE is enabled.
+
+    For a quick tunnel this discovers the public HTTPS URL and points the
+    callback at it. Any failure is logged and the app falls back to the
+    configured CALLBACK_URL.
+    """
+    global tunnel_manager
+    if settings.TUNNEL_MODE not in ('quick', 'named'):
+        return
+    try:
+        from app.utils.tunnel import TunnelManager
+
+        tunnel_manager = TunnelManager(
+            mode=settings.TUNNEL_MODE,
+            local_port=settings.PORT,
+            token=settings.TUNNEL_TOKEN,
+            binary_path=settings.CLOUDFLARED_PATH,
+            on_url_change=_on_tunnel_url_change,
+        )
+        logger.info(f"Starting Cloudflare Tunnel (mode={settings.TUNNEL_MODE})")
+        public_url = tunnel_manager.start()
+        if public_url:
+            _apply_callback_url(public_url)
+        elif settings.TUNNEL_MODE == 'quick':
+            logger.error("Quick tunnel did not yield a URL; falling back to configured CALLBACK_URL")
+    except Exception as exc:  # noqa: BLE001 - tunnel must never crash startup
+        logger.error(f"Tunnel bootstrap failed: {exc}")
+
+
 def initialize_app():
     """Initialize the application and subscribe to WebSub."""
     global community_scheduler, community_handler
@@ -695,12 +823,19 @@ def initialize_app():
     else:
         logger.info("Community post monitoring disabled (no Discord servers configured)")
     
-    # Subscribe to WebSub notifications
-    if subscription_manager.subscribe_to_channel():
-        subscription_manager.schedule_renewal()
-        logger.info("Application initialized successfully")
+    # Bring up the HTTPS tunnel (if configured) before subscribing so the hub
+    # verifies against the tunnel URL rather than the placeholder callback.
+    _start_tunnel_if_configured()
+
+    # Subscribe to WebSub notifications via the resilient watchdog, which
+    # performs an immediate subscribe (with retry/backoff) and then keeps the
+    # subscription alive by re-subscribing on staleness / near-expiry.
+    if not settings.CALLBACK_URL:
+        logger.error("No CALLBACK_URL available (tunnel failed and none configured); "
+                     "WebSub subscription cannot start")
     else:
-        logger.warning("Failed to subscribe to WebSub, but application will continue")
+        subscription_manager.run_watchdog()
+        logger.info("Application initialized successfully")
 
 
 if __name__ == '__main__':
@@ -721,11 +856,17 @@ if __name__ == '__main__':
         )
     except KeyboardInterrupt:
         logger.info("Shutting down application")
+        subscription_manager.stop()
         subscription_manager.unsubscribe_from_channel()
         if community_scheduler:
             community_scheduler.stop()
+        if tunnel_manager:
+            tunnel_manager.stop()
     except Exception as e:
         logger.error(f"Application startup failed: {e}")
+        subscription_manager.stop()
         if community_scheduler:
             community_scheduler.stop()
+        if tunnel_manager:
+            tunnel_manager.stop()
         sys.exit(1)

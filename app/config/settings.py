@@ -57,12 +57,57 @@ class Settings:
     
     def __init__(self):
         """Initialize settings from environment variables."""
+        self._load_tunnel_settings()
+        self._load_websub_settings()
         self.CALLBACK_URL, self.CALLBACK_PORT = self._resolve_callback_settings()
         self._load_discord_config()
         self._load_database_settings()
         self._validate_required_settings()
         # Normalize and validate community check interval
         self._load_community_settings()
+
+    def _load_tunnel_settings(self) -> None:
+        """Load Cloudflare Tunnel configuration.
+
+        TUNNEL_MODE controls how the public HTTPS callback is provided:
+          - 'off'   (default): no tunnel; CALLBACK_URL is used as-is.
+          - 'quick': launch an ephemeral `cloudflared` quick tunnel; the app
+                     discovers the random https://*.trycloudflare.com URL at
+                     startup, uses it as the callback, and re-subscribes on
+                     every restart (URL changes each boot).
+          - 'named': launch a `cloudflared` named tunnel from TUNNEL_TOKEN; the
+                     stable hostname is configured in the Cloudflare dashboard,
+                     so CALLBACK_URL must be set to that https URL.
+        """
+        self.TUNNEL_MODE = os.getenv('TUNNEL_MODE', 'off').strip().lower()
+        if self.TUNNEL_MODE not in {'off', 'quick', 'named'}:
+            self.TUNNEL_MODE = 'off'
+        self.TUNNEL_TOKEN = os.getenv('TUNNEL_TOKEN', '').strip()
+        # Optional explicit path to a cloudflared binary; auto-downloaded if unset.
+        self.CLOUDFLARED_PATH = os.getenv('CLOUDFLARED_PATH', '').strip()
+
+    def _load_websub_settings(self) -> None:
+        """Load WebSub subscription resilience tunables (retry/backoff/watchdog)."""
+        def _int_env(name: str, default: int, minimum: int = 1) -> int:
+            try:
+                value = int(os.getenv(name, str(default)).strip())
+            except (ValueError, AttributeError):
+                value = default
+            return max(minimum, value)
+
+        # Lease we request from the hub (YouTube caps at 5 days / 432000s).
+        self.WEBSUB_LEASE_SECONDS = _int_env('WEBSUB_LEASE_SECONDS', 432000, minimum=300)
+        # Renew this many seconds before the verified lease expires.
+        self.WEBSUB_RENEWAL_LEAD_SECONDS = _int_env('WEBSUB_RENEWAL_LEAD_SECONDS', 3600, minimum=60)
+        # Retry/backoff for a failing subscribe request (e.g. hub HTTP 503).
+        self.WEBSUB_SUBSCRIBE_MAX_RETRIES = _int_env('WEBSUB_SUBSCRIBE_MAX_RETRIES', 8, minimum=1)
+        self.WEBSUB_SUBSCRIBE_RETRY_BASE_SECONDS = _int_env('WEBSUB_SUBSCRIBE_RETRY_BASE_SECONDS', 30, minimum=1)
+        self.WEBSUB_SUBSCRIBE_RETRY_MAX_SECONDS = _int_env('WEBSUB_SUBSCRIBE_RETRY_MAX_SECONDS', 900, minimum=1)
+        # How long to wait for the hub's GET challenge before treating an
+        # accepted (HTTP 202) subscribe as unverified and retrying.
+        self.WEBSUB_VERIFY_TIMEOUT_SECONDS = _int_env('WEBSUB_VERIFY_TIMEOUT_SECONDS', 300, minimum=30)
+        # How often the watchdog checks subscription health.
+        self.WEBSUB_WATCHDOG_INTERVAL_SECONDS = _int_env('WEBSUB_WATCHDOG_INTERVAL_SECONDS', 900, minimum=30)
 
     def _load_community_settings(self) -> None:
         """Load and validate community post related settings."""
@@ -100,6 +145,10 @@ class Settings:
         """Read and validate the WebSub callback configuration from the environment."""
         raw_url = os.getenv('CALLBACK_URL', '').strip()
         if not raw_url:
+            # A quick tunnel supplies the callback URL at runtime, so it need
+            # not be configured up front. Everything else requires it.
+            if getattr(self, 'TUNNEL_MODE', 'off') == 'quick':
+                return '', 0
             raise ValueError("CALLBACK_URL environment variable must be set.")
 
         parsed = urlsplit(raw_url)
