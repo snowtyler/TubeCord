@@ -94,6 +94,7 @@ _PAGE = r"""<!doctype html>
     <div class="actions">
       <button class="primary" onclick="act('GET','/subscribe','Re-subscribe (with retry)?')">Subscribe</button>
       <button class="danger" onclick="act('GET','/unsubscribe','Unsubscribe from the hub? Delivery will stop until you subscribe again.')">Unsubscribe</button>
+      <button onclick="act('POST','/upload/check','Poll the upload feed now for anything WebSub missed?')">Poll uploads now</button>
       <button onclick="act('POST','/community/check','Force a community-post check now?')">Force community check</button>
       <button onclick="act('POST','/test-notification','Send a TEST upload to the test channel?')">Test upload → test ch.</button>
       <button onclick="act('POST','/test-livestream','Send a TEST livestream to the test channel?')">Test livestream → test ch.</button>
@@ -179,6 +180,14 @@ async function refreshAll() {
       if (c && typeof c === 'object')
         dcHtml += row('Community monitoring', badge(c.enabled?'b-ok':'b-muted', c.enabled?'on':'off')) +
                   (c.enabled ? row('Unnotified posts', esc(c.unnotified_posts)) : '');
+    } catch(e){}
+    try {
+      var u = (await getJSON('/upload/status')).body;
+      if (u && typeof u === 'object') {
+        dcHtml += row('Upload poll fallback', badge(u.enabled?'b-ok':'b-muted', u.enabled?'on':'off'));
+        if (u.enabled) dcHtml += row('Poll interval', esc(u.interval_minutes)+'m') +
+                                 row('Last poll', u.last_check_time ? ago(Math.floor((Date.now()-Date.parse(u.last_check_time))/1000)) : '—');
+      }
     } catch(e){}
     document.getElementById('dcCard').innerHTML = dcHtml;
   } catch(e) {

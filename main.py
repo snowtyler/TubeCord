@@ -42,8 +42,10 @@ test_discord_config = DiscordConfiguration.from_settings(settings, test=True)
 community_scheduler = None
 community_handler = None
 
-# Cloudflare Tunnel (optional; provides an HTTPS callback)
-tunnel_manager = None
+# Upload polling fallback (safety net for WebSub push outages)
+upload_poll_scheduler = None
+upload_notification_store = None
+upload_feed_scraper = None
 
 
 class WebSubSubscriptionManager:
@@ -227,7 +229,8 @@ subscription_manager = WebSubSubscriptionManager()
 
 
 def process_youtube_notification(notification_data: dict, *, config_source=None,
-                                 test_mode: bool = False, force_type=None) -> bool:
+                                 test_mode: bool = False, force_type=None,
+                                 source: str = 'websub') -> bool:
     """
     Process a YouTube notification and send to Discord.
 
@@ -266,7 +269,14 @@ def process_youtube_notification(notification_data: dict, *, config_source=None,
             notification = YouTubeNotification.from_websub_data(notification_data)
 
         logger.info(f"Processing notification: {notification.title} by {notification.author}"
-                    f"{' [TEST]' if test_mode else ''}")
+                    f"{' [TEST]' if test_mode else ''} (source={source})")
+
+        # Cross-path dedup: if the other path (WebSub or poll) already announced
+        # this video, don't send it again.
+        if not test_mode and upload_notification_store is not None:
+            if upload_notification_store.seen(notification.video_id):
+                logger.info(f"Skipping already-notified video {notification.video_id} (dedup)")
+                return True
 
         if not test_mode:
             # Skip completed livestreams (they've already been notified when they went live)
@@ -365,7 +375,12 @@ def process_youtube_notification(notification_data: dict, *, config_source=None,
             overall_success,
             f"Sent to {success_count}/{total_servers} servers" if overall_success else "Failed to send to any servers"
         )
-        
+
+        # Record delivered videos so the other path (WebSub/poll) won't re-send.
+        if overall_success and not test_mode and upload_notification_store is not None:
+            upload_notification_store.mark(
+                notification.video_id, notification.channel_id, notification.title, source)
+
         return overall_success
         
     except Exception as e:
@@ -795,52 +810,73 @@ def test_community_post():
         return {'status': 'error', 'message': str(e)}, 500
 
 
-def _apply_callback_url(url: str) -> None:
-    """Point the WebSub callback at ``url`` (e.g. a freshly-created tunnel)."""
-    settings.CALLBACK_URL = url
-    logger.info(f"Using callback URL: {url}")
+@app.route('/upload/status')
+def upload_status():
+    """Status of the upload polling fallback."""
+    if not upload_poll_scheduler:
+        return {'enabled': False, 'message': 'Upload polling fallback not initialized'}, 200
+    seeded = bool(upload_notification_store and upload_notification_store.is_seeded(settings.YOUTUBE_CHANNEL_ID))
+    last = upload_poll_scheduler.last_check_time
+    return {
+        'enabled': True,
+        'seeded': seeded,
+        'interval_minutes': settings.UPLOAD_CHECK_INTERVAL_MINUTES,
+        'last_check_time': last.isoformat() if last else None,
+        'configured_servers': len(discord_config.get_servers_for_type('upload')),
+    }, 200
 
 
-def _on_tunnel_url_change(url: str) -> None:
-    """Quick-tunnel URL changed (tunnel restarted): re-point and re-subscribe."""
-    _apply_callback_url(url)
-    subscription_manager.subscribe_with_retry()
-
-
-def _start_tunnel_if_configured() -> None:
-    """Start a Cloudflare Tunnel when TUNNEL_MODE is enabled.
-
-    For a quick tunnel this discovers the public HTTPS URL and points the
-    callback at it. Any failure is logged and the app falls back to the
-    configured CALLBACK_URL.
-    """
-    global tunnel_manager
-    if settings.TUNNEL_MODE not in ('quick', 'named'):
-        return
+@app.route('/upload/check', methods=['POST'])
+def force_upload_check():
+    """Force an immediate upload-feed poll."""
+    if not upload_poll_scheduler:
+        return {'status': 'error', 'message': 'Upload polling fallback not initialized'}, 400
     try:
-        from app.utils.tunnel import TunnelManager
+        delivered = _poll_uploads_once()
+        return {'status': 'success', 'delivered': delivered}, 200
+    except Exception as e:
+        logger.error(f"Error in forced upload check: {e}")
+        return {'status': 'error', 'message': str(e)}, 500
 
-        tunnel_manager = TunnelManager(
-            mode=settings.TUNNEL_MODE,
-            local_port=settings.PORT,
-            token=settings.TUNNEL_TOKEN,
-            binary_path=settings.CLOUDFLARED_PATH,
-            on_url_change=_on_tunnel_url_change,
-        )
-        logger.info(f"Starting Cloudflare Tunnel (mode={settings.TUNNEL_MODE})")
-        public_url = tunnel_manager.start()
-        if public_url:
-            _apply_callback_url(public_url)
-        elif settings.TUNNEL_MODE == 'quick':
-            logger.error("Quick tunnel did not yield a URL; falling back to configured CALLBACK_URL")
-    except Exception as exc:  # noqa: BLE001 - tunnel must never crash startup
-        logger.error(f"Tunnel bootstrap failed: {exc}")
+
+def _poll_uploads_once() -> int:
+    """One upload-poll cycle: fetch the feed and deliver anything WebSub missed.
+
+    On the first run for a channel the current feed is seeded as already-seen so
+    the backlog isn't blasted; thereafter only new videos are delivered. Returns
+    the number of videos delivered this cycle.
+    """
+    if upload_feed_scraper is None or upload_notification_store is None:
+        return 0
+
+    channel_id = settings.YOUTUBE_CHANNEL_ID
+    entries = upload_feed_scraper.fetch_entries(channel_id)
+    if not entries:
+        logger.debug("Upload poll: feed returned no entries")
+        return 0
+
+    if not upload_notification_store.is_seeded(channel_id):
+        upload_notification_store.seed(channel_id, entries)
+        return 0
+
+    # Oldest-first so multiple missed uploads arrive in publish order.
+    delivered = 0
+    for entry in reversed(entries):
+        if upload_notification_store.seen(entry['video_id']):
+            continue
+        logger.info(f"Upload poll: delivering missed video {entry['video_id']} - {entry['title']}")
+        if process_youtube_notification(entry, source='poll'):
+            delivered += 1
+        else:
+            logger.warning(f"Upload poll: delivery failed for {entry['video_id']}, will retry next cycle")
+    return delivered
 
 
 def initialize_app():
     """Initialize the application and subscribe to WebSub."""
     global community_scheduler, community_handler
-    
+    global upload_poll_scheduler, upload_notification_store, upload_feed_scraper
+
     logger.info(f"Initializing TubeCord v{VERSION}")
     
     # Log configuration
@@ -885,19 +921,31 @@ def initialize_app():
     else:
         logger.info("Community post monitoring disabled (no Discord servers configured)")
     
-    # Bring up the HTTPS tunnel (if configured) before subscribing so the hub
-    # verifies against the tunnel URL rather than the placeholder callback.
-    _start_tunnel_if_configured()
+    # Initialize the upload polling fallback (safety net for WebSub push
+    # outages, e.g. Google Issue Tracker 554905105) if upload webhooks exist.
+    upload_servers = discord_config.get_servers_for_type('upload')
+    if settings.UPLOAD_POLL_ENABLED and len(upload_servers) > 0:
+        try:
+            from app.utils.upload_poller import UploadFeedScraper, UploadNotificationStore, UploadPollScheduler
+
+            upload_notification_store = UploadNotificationStore()
+            upload_feed_scraper = UploadFeedScraper()
+            interval = settings.UPLOAD_CHECK_INTERVAL_MINUTES
+            upload_poll_scheduler = UploadPollScheduler(interval, _poll_uploads_once)
+            upload_poll_scheduler.start()
+            logger.info(f"Upload polling fallback started (checking every {interval} minutes)")
+        except Exception as e:
+            logger.error(f"Failed to initialize upload polling fallback: {e}")
+    elif not settings.UPLOAD_POLL_ENABLED:
+        logger.info("Upload polling fallback disabled (UPLOAD_POLL_ENABLED=false)")
+    else:
+        logger.info("Upload polling fallback disabled (no upload webhooks configured)")
 
     # Subscribe to WebSub notifications via the resilient watchdog, which
     # performs an immediate subscribe (with retry/backoff) and then keeps the
     # subscription alive by re-subscribing on staleness / near-expiry.
-    if not settings.CALLBACK_URL:
-        logger.error("No CALLBACK_URL available (tunnel failed and none configured); "
-                     "WebSub subscription cannot start")
-    else:
-        subscription_manager.run_watchdog()
-        logger.info("Application initialized successfully")
+    subscription_manager.run_watchdog()
+    logger.info("Application initialized successfully")
 
 
 if __name__ == '__main__':
@@ -922,13 +970,13 @@ if __name__ == '__main__':
         subscription_manager.unsubscribe_from_channel()
         if community_scheduler:
             community_scheduler.stop()
-        if tunnel_manager:
-            tunnel_manager.stop()
+        if upload_poll_scheduler:
+            upload_poll_scheduler.stop()
     except Exception as e:
         logger.error(f"Application startup failed: {e}")
         subscription_manager.stop()
         if community_scheduler:
             community_scheduler.stop()
-        if tunnel_manager:
-            tunnel_manager.stop()
+        if upload_poll_scheduler:
+            upload_poll_scheduler.stop()
         sys.exit(1)

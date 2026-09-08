@@ -66,7 +66,6 @@ class Settings:
     
     def __init__(self):
         """Initialize settings from environment variables."""
-        self._load_tunnel_settings()
         self._load_websub_settings()
         self.CALLBACK_URL, self.CALLBACK_PORT = self._resolve_callback_settings()
         self._load_discord_config()
@@ -74,26 +73,22 @@ class Settings:
         self._validate_required_settings()
         # Normalize and validate community check interval
         self._load_community_settings()
+        self._load_upload_poll_settings()
 
-    def _load_tunnel_settings(self) -> None:
-        """Load Cloudflare Tunnel configuration.
+    def _load_upload_poll_settings(self) -> None:
+        """Load the upload polling fallback config.
 
-        TUNNEL_MODE controls how the public HTTPS callback is provided:
-          - 'off'   (default): no tunnel; CALLBACK_URL is used as-is.
-          - 'quick': launch an ephemeral `cloudflared` quick tunnel; the app
-                     discovers the random https://*.trycloudflare.com URL at
-                     startup, uses it as the callback, and re-subscribes on
-                     every restart (URL changes each boot).
-          - 'named': launch a `cloudflared` named tunnel from TUNNEL_TOKEN; the
-                     stable hostname is configured in the Cloudflare dashboard,
-                     so CALLBACK_URL must be set to that https URL.
+        WebSub push can silently stall (see Google Issue Tracker 554905105), so
+        the channel's upload feed is polled as a safety net; anything WebSub
+        missed is delivered and deduplicated so it is never sent twice.
         """
-        self.TUNNEL_MODE = os.getenv('TUNNEL_MODE', 'off').strip().lower()
-        if self.TUNNEL_MODE not in {'off', 'quick', 'named'}:
-            self.TUNNEL_MODE = 'off'
-        self.TUNNEL_TOKEN = os.getenv('TUNNEL_TOKEN', '').strip()
-        # Optional explicit path to a cloudflared binary; auto-downloaded if unset.
-        self.CLOUDFLARED_PATH = os.getenv('CLOUDFLARED_PATH', '').strip()
+        self.UPLOAD_POLL_ENABLED = os.getenv('UPLOAD_POLL_ENABLED', 'true').strip().lower() in {'1', 'true', 'yes', 'on'}
+        raw = os.getenv('UPLOAD_CHECK_INTERVAL_MINUTES', '15').strip()
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 15
+        self.UPLOAD_CHECK_INTERVAL_MINUTES = min(24 * 60, max(1, value))
 
     def _load_websub_settings(self) -> None:
         """Load WebSub subscription resilience tunables (retry/backoff/watchdog)."""
@@ -154,10 +149,6 @@ class Settings:
         """Read and validate the WebSub callback configuration from the environment."""
         raw_url = os.getenv('CALLBACK_URL', '').strip()
         if not raw_url:
-            # A quick tunnel supplies the callback URL at runtime, so it need
-            # not be configured up front. Everything else requires it.
-            if getattr(self, 'TUNNEL_MODE', 'off') == 'quick':
-                return '', 0
             raise ValueError("CALLBACK_URL environment variable must be set.")
 
         parsed = urlsplit(raw_url)
