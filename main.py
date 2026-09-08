@@ -420,6 +420,14 @@ def webhook():
     return '', 405
 
 
+@app.route('/')
+@app.route('/dashboard')
+def dashboard():
+    """Serve the operator WebSub dashboard (HTML)."""
+    from app.web.dashboard import render_dashboard
+    return render_dashboard(VERSION), 200, {'Content-Type': 'text/html; charset=utf-8'}
+
+
 @app.route('/health')
 def health_check():
     """Health check endpoint for monitoring."""
