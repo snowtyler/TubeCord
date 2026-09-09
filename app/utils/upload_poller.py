@@ -3,9 +3,14 @@
 YouTube's WebSub/PubSubHubbub push pipeline periodically degrades — subscribe
 requests 503, verification challenges never arrive, and upload notifications go
 missing for hours (Google Issue Tracker 554905105). To stay resilient, TubeCord
-polls the channel's public upload feed on a schedule and delivers anything the
-push pipeline missed. A shared ``notified_videos`` table deduplicates against the
+polls the channel's recent uploads on a schedule and delivers anything the push
+pipeline missed. A shared ``notified_videos`` table deduplicates against the
 WebSub path so a video is never announced twice, whichever path sees it first.
+
+Uploads are read from the YouTube Data API (the channel's uploads playlist),
+because the public ``videos.xml`` RSS feed frequently returns an empty static
+placeholder to server-side requests. RSS is kept only as a fallback for
+deployments without an API key.
 """
 
 import threading
@@ -14,7 +19,7 @@ from datetime import datetime, timezone
 from typing import Callable, List, Dict, Any, Optional
 
 import requests
-from sqlalchemy import Column, MetaData, String, Table, Text, select
+from sqlalchemy import Column, MetaData, String, Table, Text, func, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
@@ -49,10 +54,6 @@ class UploadNotificationStore:
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
 
-    @staticmethod
-    def _seed_marker(channel_id: str) -> str:
-        return f"__seeded__:{channel_id}"
-
     def seen(self, video_id: str) -> bool:
         stmt = select(notified_videos_table.c.video_id).where(
             notified_videos_table.c.video_id == video_id
@@ -82,37 +83,93 @@ class UploadNotificationStore:
             logger.error("notified_videos insert failed: %s", exc)
             return False
 
-    def is_seeded(self, channel_id: str) -> bool:
-        return self.seen(self._seed_marker(channel_id))
-
-    def seed(self, channel_id: str, entries: List[Dict[str, Any]]) -> None:
-        """Record the current feed as already-seen so the first poll after a
-        fresh install doesn't blast the backlog. New uploads notify normally."""
-        for entry in entries:
-            self.mark(entry["video_id"], entry.get("channel_id", channel_id),
-                      entry.get("title", ""), "seed")
-        self.mark(self._seed_marker(channel_id), channel_id, "seed marker", "seed")
-        logger.info("Upload poller seeded %d existing videos for %s", len(entries), channel_id)
+    def count(self) -> int:
+        try:
+            with self.engine.connect() as conn:
+                return int(conn.execute(select(func.count()).select_from(notified_videos_table)).scalar() or 0)
+        except SQLAlchemyError:
+            return 0
 
 
 class UploadFeedScraper:
-    """Fetches and parses a channel's public upload Atom feed."""
+    """Fetches a channel's recent uploads via the YouTube Data API (with an RSS
+    fallback for deployments that have no API key)."""
 
-    FEED_URL = "https://www.youtube.com/xml/feeds/videos.xml?channel_id={cid}"
+    API_URL = "https://www.googleapis.com/youtube/v3/playlistItems"
+    RSS_URL = "https://www.youtube.com/xml/feeds/videos.xml?channel_id={cid}"
     NS = {
         "atom": "http://www.w3.org/2005/Atom",
         "yt": "http://www.youtube.com/xml/schemas/2015",
     }
 
+    def __init__(self, api_key: Optional[str] = None, max_results: int = 15):
+        self.api_key = api_key if api_key is not None else settings.YOUTUBE_API_KEY
+        self.max_results = max_results
+
+    @staticmethod
+    def _uploads_playlist_id(channel_id: str) -> Optional[str]:
+        # A channel's uploads playlist is its channel id with the "UC" prefix
+        # swapped for "UU".
+        if channel_id and channel_id.startswith("UC") and len(channel_id) > 2:
+            return "UU" + channel_id[2:]
+        return None
+
     def fetch_entries(self, channel_id: str) -> List[Dict[str, Any]]:
-        url = self.FEED_URL.format(cid=channel_id)
+        if self.api_key:
+            return self._fetch_via_api(channel_id)
+        logger.warning("No YOUTUBE_API_KEY set; upload poller falling back to RSS "
+                       "(often returns an empty placeholder server-side)")
+        return self._fetch_via_rss(channel_id)
+
+    def _fetch_via_api(self, channel_id: str) -> List[Dict[str, Any]]:
+        playlist_id = self._uploads_playlist_id(channel_id)
+        if not playlist_id:
+            logger.error("Cannot derive uploads playlist for channel %s", channel_id)
+            return []
+        params = {
+            "part": "snippet,contentDetails",
+            "maxResults": self.max_results,
+            "playlistId": playlist_id,
+            "key": self.api_key,
+        }
+        try:
+            resp = requests.get(self.API_URL, params=params, timeout=15)
+        except requests.RequestException as exc:
+            logger.error("Upload API request failed for %s: %s", channel_id, exc)
+            return []
+        if resp.status_code != 200:
+            logger.error("Upload API returned %s for %s: %s",
+                         resp.status_code, channel_id, resp.text[:200])
+            return []
+
+        entries: List[Dict[str, Any]] = []
+        for item in resp.json().get("items", []):
+            snippet = item.get("snippet") or {}
+            details = item.get("contentDetails") or {}
+            video_id = details.get("videoId") or (snippet.get("resourceId") or {}).get("videoId")
+            if not video_id:
+                continue
+            published = details.get("videoPublishedAt") or snippet.get("publishedAt")
+            entries.append({
+                "video_id": video_id,
+                "channel_id": snippet.get("videoOwnerChannelId") or channel_id,
+                "title": snippet.get("title", "Unknown Title"),
+                "author": snippet.get("videoOwnerChannelTitle")
+                          or snippet.get("channelTitle", "Unknown Author"),
+                "published": published,
+                "updated": published,
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+            })
+        return entries
+
+    def _fetch_via_rss(self, channel_id: str) -> List[Dict[str, Any]]:
+        url = self.RSS_URL.format(cid=channel_id)
         try:
             resp = requests.get(
                 url,
                 timeout=15,
                 headers={
-                    # A browser-ish UA avoids YouTube's empty placeholder feed.
-                    "User-Agent": "Mozilla/5.0 (compatible; TubeCord/1.0; +https://github.com/snowtyler/TubeCord)",
+                    "User-Agent": "Mozilla/5.0 (compatible; TubeCord/1.0)",
                     "Accept": "application/atom+xml,application/xml,text/xml",
                 },
             )
@@ -120,7 +177,6 @@ class UploadFeedScraper:
         except requests.RequestException as exc:
             logger.error("Failed to fetch upload feed for %s: %s", channel_id, exc)
             return []
-
         try:
             root = ET.fromstring(resp.content)
         except ET.ParseError as exc:

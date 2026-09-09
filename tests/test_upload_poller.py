@@ -1,121 +1,105 @@
-"""Tests for the upload polling fallback: feed parsing, seeding, and dedup."""
+"""Tests for the upload polling fallback: API parsing, dedup, and catch-up window."""
+
+from datetime import datetime, timedelta, timezone
 
 import main
 from sqlalchemy import create_engine
 
 from app.utils.upload_poller import UploadFeedScraper, UploadNotificationStore
 
-SAMPLE_FEED = """<?xml version="1.0" encoding="UTF-8"?>
-<feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" xmlns="http://www.w3.org/2005/Atom">
-  <title>YouTube video feed</title>
-  <entry>
-    <id>yt:video:VID000000001</id>
-    <yt:videoId>VID000000001</yt:videoId>
-    <yt:channelId>UCTESTCHANNELIDAAAAAAAA</yt:channelId>
-    <title>Newest video</title>
-    <link rel="alternate" href="https://www.youtube.com/watch?v=VID000000001"/>
-    <author><name>Test Author</name></author>
-    <published>2026-09-08T10:00:00+00:00</published>
-    <updated>2026-09-08T10:05:00+00:00</updated>
-  </entry>
-  <entry>
-    <id>yt:video:VID000000002</id>
-    <yt:videoId>VID000000002</yt:videoId>
-    <yt:channelId>UCTESTCHANNELIDAAAAAAAA</yt:channelId>
-    <title>Older video</title>
-    <link rel="alternate" href="https://www.youtube.com/watch?v=VID000000002"/>
-    <author><name>Test Author</name></author>
-    <published>2026-09-07T10:00:00+00:00</published>
-    <updated>2026-09-07T10:05:00+00:00</updated>
-  </entry>
-</feed>"""
+
+def _iso(dt):
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _api_payload(videos):
+    return {"items": [
+        {"snippet": {"title": t, "videoOwnerChannelId": c, "videoOwnerChannelTitle": "Chan"},
+         "contentDetails": {"videoId": v, "videoPublishedAt": p}}
+        for (v, c, t, p) in videos
+    ]}
 
 
 class _Resp:
-    def __init__(self, content):
-        self.content = content.encode("utf-8")
+    def __init__(self, payload, status=200):
+        self._payload = payload
+        self.status_code = status
+        self.text = ""
 
-    def raise_for_status(self):
-        pass
+    def json(self):
+        return self._payload
 
 
 def _store():
-    # Isolated in-memory DB per test.
     return UploadNotificationStore(engine=create_engine("sqlite://"))
 
 
-def test_feed_parsing(monkeypatch):
-    scraper = UploadFeedScraper()
-    monkeypatch.setattr("app.utils.upload_poller.requests.get", lambda *a, **k: _Resp(SAMPLE_FEED))
-    entries = scraper.fetch_entries("UCTESTCHANNELIDAAAAAAAA")
-    assert [e["video_id"] for e in entries] == ["VID000000001", "VID000000002"]
-    assert entries[0]["title"] == "Newest video"
-    assert entries[0]["author"] == "Test Author"
-    assert entries[0]["url"] == "https://www.youtube.com/watch?v=VID000000001"
-    assert entries[0]["channel_id"] == "UCTESTCHANNELIDAAAAAAAA"
-
-
-def test_seed_then_dedup(monkeypatch):
-    store = _store()
+def test_api_parsing(monkeypatch):
     ch = "UCTESTCHANNELIDAAAAAAAA"
-    assert store.is_seeded(ch) is False
-
-    entries = [
-        {"video_id": "VID000000001", "channel_id": ch, "title": "a"},
-        {"video_id": "VID000000002", "channel_id": ch, "title": "b"},
-    ]
-    store.seed(ch, entries)
-    assert store.is_seeded(ch) is True
-    assert store.seen("VID000000001") is True
-    assert store.seen("VID000000002") is True
-    assert store.seen("VID999999999") is False
-
-    # mark is idempotent (no duplicate-key crash)
-    assert store.mark("VID000000003", ch, "c", "poll") is True
-    assert store.mark("VID000000003", ch, "c", "poll") is False
-    assert store.seen("VID000000003") is True
+    payload = _api_payload([
+        ("VIDNEWEST001", ch, "Newest", "2026-09-09T10:00:00Z"),
+        ("VIDOLDER0002", ch, "Older", "2026-09-08T10:00:00Z"),
+    ])
+    monkeypatch.setattr("app.utils.upload_poller.requests.get", lambda *a, **k: _Resp(payload))
+    scraper = UploadFeedScraper(api_key="test-key")
+    entries = scraper.fetch_entries(ch)
+    assert [e["video_id"] for e in entries] == ["VIDNEWEST001", "VIDOLDER0002"]
+    assert entries[0]["title"] == "Newest"
+    assert entries[0]["url"] == "https://www.youtube.com/watch?v=VIDNEWEST001"
 
 
-def test_poll_seeds_first_run_then_delivers_new(monkeypatch):
+def test_uploads_playlist_id():
+    assert UploadFeedScraper._uploads_playlist_id("UCabc123") == "UUabc123"
+    assert UploadFeedScraper._uploads_playlist_id("bogus") is None
+
+
+def test_store_dedup(monkeypatch):
+    store = _store()
+    assert store.seen("VID1") is False
+    assert store.mark("VID1", "UCx", "t", "poll") is True
+    assert store.mark("VID1", "UCx", "t", "poll") is False  # idempotent
+    assert store.seen("VID1") is True
+    assert store.count() == 1
+
+
+def test_poll_delivers_recent_skips_old_and_dedupes(monkeypatch):
     ch = main.settings.YOUTUBE_CHANNEL_ID
     store = _store()
     monkeypatch.setattr(main, "upload_notification_store", store)
-    monkeypatch.setattr(main, "upload_feed_scraper", UploadFeedScraper())
+    monkeypatch.setattr(main, "upload_feed_scraper", UploadFeedScraper(api_key="k"))
+    monkeypatch.setattr(main.settings, "UPLOAD_MAX_AGE_HOURS", 48)
 
-    feed = {"content": SAMPLE_FEED.replace("UCTESTCHANNELIDAAAAAAAA", ch)}
-    monkeypatch.setattr("app.utils.upload_poller.requests.get",
-                        lambda *a, **k: _Resp(feed["content"]))
+    now = datetime.now(timezone.utc)
+    recent = _iso(now - timedelta(hours=1))     # within window -> deliver
+    old = _iso(now - timedelta(hours=100))       # outside window -> record silently
+    payload = _api_payload([
+        ("VIDRECENT001", ch, "Recent upload", recent),
+        ("VIDOLD000002", ch, "Old backlog", old),
+    ])
+    monkeypatch.setattr("app.utils.upload_poller.requests.get", lambda *a, **k: _Resp(payload))
 
     sent = []
     monkeypatch.setattr(main.discord_client, "send_youtube_notification",
                         lambda webhook_url, **kw: sent.append(kw.get("notification_data", {}).get("video_id")) or True)
-    # Ensure there's an upload destination and no API calls during classify.
+
     from app.models.discord_config import DiscordConfiguration
     cfg = DiscordConfiguration()
     cfg.add_server("https://discord.com/api/webhooks/1/t", [], "upload", "u")
     monkeypatch.setattr(main, "discord_config", cfg)
+    # Skip the classification API call: build the notification directly.
     monkeypatch.setattr(main.YouTubeNotification, "from_websub_data",
                         classmethod(lambda cls, d: cls(
                             video_id=d["video_id"], channel_id=d["channel_id"], title=d["title"],
                             author=d.get("author", "a"), url=d["url"],
                             published=d.get("published"), updated=d.get("updated"))))
 
-    # First run: seeds, sends nothing.
-    assert main._poll_uploads_once() == 0
-    assert sent == []
-    assert store.is_seeded(ch) is True
-
-    # A brand-new upload appears at the top of the feed.
-    new_feed = feed["content"].replace(
-        "<yt:videoId>VID000000001</yt:videoId>", "<yt:videoId>VIDNEW00000A</yt:videoId>")
-    new_feed = new_feed.replace("watch?v=VID000000001", "watch?v=VIDNEW00000A")
-    feed["content"] = new_feed
-
     delivered = main._poll_uploads_once()
     assert delivered == 1
-    assert sent == ["VIDNEW00000A"]
+    assert sent == ["VIDRECENT001"]          # recent delivered
+    assert store.seen("VIDRECENT001") is True
+    assert store.seen("VIDOLD000002") is True  # old one recorded, not sent
 
-    # Running again delivers nothing (deduped).
+    # Second poll: nothing new -> nothing sent (deduped).
     sent.clear()
     assert main._poll_uploads_once() == 0
     assert sent == []

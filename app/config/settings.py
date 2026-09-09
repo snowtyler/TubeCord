@@ -89,6 +89,13 @@ class Settings:
         except ValueError:
             value = 15
         self.UPLOAD_CHECK_INTERVAL_MINUTES = min(24 * 60, max(1, value))
+        # Only deliver polled uploads published within this many hours; older
+        # ones are recorded silently so a fresh install doesn't blast the backlog.
+        try:
+            age = int(os.getenv('UPLOAD_MAX_AGE_HOURS', '48').strip())
+        except ValueError:
+            age = 48
+        self.UPLOAD_MAX_AGE_HOURS = min(720, max(1, age))
 
     def _load_websub_settings(self) -> None:
         """Load WebSub subscription resilience tunables (retry/backoff/watchdog)."""

@@ -230,7 +230,7 @@ subscription_manager = WebSubSubscriptionManager()
 
 def process_youtube_notification(notification_data: dict, *, config_source=None,
                                  test_mode: bool = False, force_type=None,
-                                 source: str = 'websub') -> bool:
+                                 source: str = 'websub', enforce_recency: bool = True) -> bool:
     """
     Process a YouTube notification and send to Discord.
 
@@ -284,8 +284,9 @@ def process_youtube_notification(notification_data: dict, *, config_source=None,
                 logger.info(f"Skipping completed livestream notification: {notification.title}")
                 return True
 
-            # Check if notification is recent (avoid spam from old videos)
-            if not notification.is_recent(hours=24):
+            # Check if notification is recent (avoid spam from old videos). The
+            # poller applies its own catch-up window, so it opts out of this gate.
+            if enforce_recency and not notification.is_recent(hours=24):
                 logger.info(f"Skipping old notification: {notification.title}")
                 return True
 
@@ -815,12 +816,13 @@ def upload_status():
     """Status of the upload polling fallback."""
     if not upload_poll_scheduler:
         return {'enabled': False, 'message': 'Upload polling fallback not initialized'}, 200
-    seeded = bool(upload_notification_store and upload_notification_store.is_seeded(settings.YOUTUBE_CHANNEL_ID))
     last = upload_poll_scheduler.last_check_time
     return {
         'enabled': True,
-        'seeded': seeded,
+        'source': 'api' if settings.YOUTUBE_API_KEY else 'rss',
         'interval_minutes': settings.UPLOAD_CHECK_INTERVAL_MINUTES,
+        'max_age_hours': settings.UPLOAD_MAX_AGE_HOURS,
+        'tracked_videos': upload_notification_store.count() if upload_notification_store else 0,
         'last_check_time': last.isoformat() if last else None,
         'configured_servers': len(discord_config.get_servers_for_type('upload')),
     }, 200
@@ -839,12 +841,24 @@ def force_upload_check():
         return {'status': 'error', 'message': str(e)}, 500
 
 
-def _poll_uploads_once() -> int:
-    """One upload-poll cycle: fetch the feed and deliver anything WebSub missed.
+def _published_within_hours(published: str, hours: int) -> bool:
+    """True if an ISO-8601 published timestamp is within the last ``hours``.
+    Unparseable/missing timestamps are treated as recent (deliver, don't drop)."""
+    if not published:
+        return True
+    try:
+        dt = datetime.fromisoformat(published.replace('Z', '+00:00'))
+    except (ValueError, AttributeError):
+        return True
+    return (datetime.now(timezone.utc) - dt).total_seconds() <= hours * 3600
 
-    On the first run for a channel the current feed is seeded as already-seen so
-    the backlog isn't blasted; thereafter only new videos are delivered. Returns
-    the number of videos delivered this cycle.
+
+def _poll_uploads_once() -> int:
+    """One upload-poll cycle: fetch recent uploads and deliver anything WebSub
+    missed. Uploads within the catch-up window (UPLOAD_MAX_AGE_HOURS) that
+    haven't been announced are delivered; older ones are recorded silently so a
+    fresh install / long backlog isn't blasted. Deduplicated against WebSub via
+    the shared store. Returns the number of videos delivered this cycle.
     """
     if upload_feed_scraper is None or upload_notification_store is None:
         return 0
@@ -852,23 +866,29 @@ def _poll_uploads_once() -> int:
     channel_id = settings.YOUTUBE_CHANNEL_ID
     entries = upload_feed_scraper.fetch_entries(channel_id)
     if not entries:
-        logger.debug("Upload poll: feed returned no entries")
+        logger.debug("Upload poll: no uploads returned")
         return 0
 
-    if not upload_notification_store.is_seeded(channel_id):
-        upload_notification_store.seed(channel_id, entries)
-        return 0
-
-    # Oldest-first so multiple missed uploads arrive in publish order.
+    max_age = settings.UPLOAD_MAX_AGE_HOURS
     delivered = 0
+    # Oldest-first so multiple missed uploads arrive in publish order.
     for entry in reversed(entries):
-        if upload_notification_store.seen(entry['video_id']):
+        video_id = entry['video_id']
+        if upload_notification_store.seen(video_id):
             continue
-        logger.info(f"Upload poll: delivering missed video {entry['video_id']} - {entry['title']}")
-        if process_youtube_notification(entry, source='poll'):
+
+        if not _published_within_hours(entry.get('published'), max_age):
+            # Older than the catch-up window: record without announcing.
+            upload_notification_store.mark(video_id, entry['channel_id'], entry['title'], 'backlog')
+            continue
+
+        logger.info(f"Upload poll: delivering video WebSub missed: {video_id} - {entry['title']}")
+        # enforce_recency=False: the catch-up window above is the age gate.
+        if process_youtube_notification(entry, source='poll', enforce_recency=False):
+            upload_notification_store.mark(video_id, entry['channel_id'], entry['title'], 'poll')
             delivered += 1
         else:
-            logger.warning(f"Upload poll: delivery failed for {entry['video_id']}, will retry next cycle")
+            logger.warning(f"Upload poll: delivery failed for {video_id}, will retry next cycle")
     return delivered
 
 

@@ -8,13 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Upload polling fallback: the channel's upload feed is polled on a schedule
-  (`UPLOAD_CHECK_INTERVAL_MINUTES`, default 15) and anything WebSub push missed
-  is delivered anyway — resilience against the ongoing YouTube WebSub delivery
-  degradation (Google Issue Tracker 554905105). A shared `notified_videos` table
-  deduplicates across the push and poll paths so a video is never sent twice; the
-  current feed is seeded as already-seen on first run so the backlog isn't
-  blasted. New `/upload/status` and `/upload/check` endpoints and dashboard tile.
+- Upload polling fallback: the channel's recent uploads are polled on a schedule
+  (`UPLOAD_CHECK_INTERVAL_MINUTES`, default 15) via the YouTube Data API and
+  anything WebSub push missed is delivered anyway — resilience against the
+  ongoing YouTube WebSub delivery degradation (Google Issue Tracker 554905105).
+  A shared `notified_videos` table deduplicates across the push and poll paths so
+  a video is never sent twice; only uploads newer than `UPLOAD_MAX_AGE_HOURS`
+  (default 48) are announced so a long backlog isn't blasted. New `/upload/status`
+  and `/upload/check` endpoints and dashboard tile. (The public RSS feed is not
+  used — it returns an empty placeholder to server-side requests.)
 - WebSub subscription resilience: failed subscribe requests are retried with
   exponential backoff + jitter (rides out the hub's intermittent HTTP 503s), and
   a background watchdog re-subscribes when the subscription is unverified, near
